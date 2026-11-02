@@ -15,8 +15,8 @@ Branch: `feat/remote-whiteboard` (work units merged to `main` of FullFran/mcp_ex
 | ID | Specs | Route | Status | Evidence |
 |----|-------|-------|--------|----------|
 | T0 | S1, S6 | inline | done | fork + clone + upstream remote; milestones 1-4, issues #1-#8; Notion ticket 40c21333-8135-81f3-b292-f1b2b9e2fb4c; baseline `npm test` exit 0 at 66b768b |
-| T1 | S2 | delegated (writer trigger b: long-session context backstop) | done (uncommitted) | RED: `npm run test:mcp-http` 7/9 failing (404 on /mcp); GREEN: 9/9; `npm run test:mcp` 5/5; `npm test` exit 0; `npm run type-check` exit 0 |
-| T2 | S3 | delegated (writer trigger b: long-session context backstop) | done (uncommitted) | RED: `scripts/check-auth.mjs` vs 4665a8f fails (HOST=0.0.0.0 starts without auth); GREEN: `npm run test:auth` 27/27; `npm test` exit 0; `npm run type-check` exit 0; differential vs 4665a8f (`--help`, stdio wire, REST/WS on default loopback) identical. Risk item 2 (auth): independent verifier over T1+T2 pending |
+| T1 | S2 | delegated (writer trigger b: long-session context backstop) | done (642420c) | RED: `npm run test:mcp-http` 7/9 failing (404 on /mcp); GREEN: 9/9; `npm run test:mcp` 5/5; `npm test` exit 0; `npm run type-check` exit 0 |
+| T2 | S3 | delegated (writer trigger b: long-session context backstop) | done | 36b0d77; independent verification found B1, fixed in 220abe1 |
 | T2b | S3 (device flow) | delegated (writer trigger b: long-session context backstop) | done | 220abe1 + B2 fix; independent verification B1 closed, B2 fixed and pinned |
 | T3 | S4 | pending | pending | |
 | T4 | S5 | pending | blocked: needs VPS authorization | |
