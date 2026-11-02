@@ -15,7 +15,7 @@ Branch: `feat/remote-whiteboard` (work units merged to `main` of FullFran/mcp_ex
 | ID | Specs | Route | Status | Evidence |
 |----|-------|-------|--------|----------|
 | T0 | S1, S6 | inline | done | fork + clone + upstream remote; milestones 1-4, issues #1-#8; Notion ticket 40c21333-8135-81f3-b292-f1b2b9e2fb4c; baseline `npm test` exit 0 at 66b768b |
-| T1 | S2 | delegated (writer trigger b: long-session context backstop) | in progress | |
+| T1 | S2 | delegated (writer trigger b: long-session context backstop) | done (uncommitted) | RED: `npm run test:mcp-http` 7/9 failing (404 on /mcp); GREEN: 9/9; `npm run test:mcp` 5/5; `npm test` exit 0; `npm run type-check` exit 0 |
 | T2 | S3 | pending | pending | |
 | T3 | S4 | pending | pending | |
 | T4 | S5 | pending | blocked: needs VPS authorization | |
@@ -26,3 +26,4 @@ Branch: `feat/remote-whiteboard` (work units merged to `main` of FullFran/mcp_ex
 - L2 (2026-11-02, Fran): "me gusta mucho, hazlo! y deja ticket en notion. y organiza issues y milestones. inicializalo en mi maquina en la carpeta fullfran porque es un proyecto personal"
 - L3: upstream 2.1.2 (66b768b) already uses `@modelcontextprotocol/server` 2.0.0 but only over stdio; the canvas server (Express + WS, `src/server.ts`) has no authentication. Spec 2026-07-28: stateless (no initialize, no Mcp-Session-Id), DCR deprecated in favour of CIMD, RFC 9207 `iss`. ChatGPT needs a public HTTPS `/mcp` with OAuth and allowlisted redirect `https://chatgpt.com/connector_platform_oauth_redirect`.
 - L4: Why this repo and not devdotfast/whiteboard: the latter is a code-review canvas where only the agent draws; Fran wants to write by hand on a shared board.
+- L5 (2026-11-02, T1): `/mcp` uses the SDK's own `createMcpHandler` (`@modelcontextprotocol/server` 2.0.0; no `@modelcontextprotocol/node`/`express` adapter installed, so `src/core/mcp-http.ts` bridges Express to the web-standard Request/Response). 2025-era clients are served by the SDK's stateless legacy fallback: `initialize` works but no `Mcp-Session-Id` is issued and GET/DELETE answer 405. In-process tools are repointed at the server's own listener (`useInProcessCanvasUrl`) so HTTP tool calls hit the same canvas as REST. Host/Origin guard (SDK helpers) only on loopback binds, allowing the `PUBLIC_BASE_URL` hostname; `TRUST_PROXY` off by default. Auth seam for T2: `createMcpHttpRouter({ authMiddleware })`, principal via `res.locals.mcpAuthInfo`. Differential vs a7a6894: `--help`, stdio wire test, and REST responses identical; `/mcp` 404 -> 405 on GET.

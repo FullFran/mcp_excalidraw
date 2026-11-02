@@ -271,6 +271,8 @@ The MCP server runs over stdio. Since v1.1 the simplest config is `npx` — no c
 | `EXCALIDRAW_SHARE_UPLOAD_URL` | Where `share` uploads the encrypted scene (an excalidraw-json `POST` endpoint) | `https://json.excalidraw.com/api/v2/post/` |
 | `EXCALIDRAW_SHARE_BASE_URL` | Excalidraw app that share links open in | `https://excalidraw.com` |
 | `PORT` / `HOST` | Canvas server bind address | `3000` / `127.0.0.1` |
+| `PUBLIC_BASE_URL` | Public URL of the canvas server behind a reverse proxy (e.g. `https://board.example.com`); used for absolute URLs and allowed through the `/mcp` Host/Origin check | (unset) |
+| `TRUST_PROXY` | Express `trust proxy` setting: `true`, a hop count, or an address list such as `loopback` | (unset; off) |
 | `LOG_LEVEL` | Log verbosity (`error`, `warn`, `info`, `debug`) | `info` |
 | `LOG_FILE_PATH` | Log file location | `~/Library/Logs/excalidraw-mcp.log` (macOS), `$XDG_STATE_HOME/excalidraw-mcp/excalidraw.log` (Linux), `%LOCALAPPDATA%\Excalidraw-MCP\excalidraw.log` (Windows) |
 
@@ -281,7 +283,7 @@ There are two separate connections:
 - **MCP client ↔ MCP process:** an MCP client that supports local commands launches the stdio MCP process and owns its stdin/stdout.
 - **MCP process ↔ canvas:** `EXPRESS_SERVER_URL` points to the canvas server's REST API. The browser UI uses a WebSocket on that same server and port.
 
-The canvas HTTP URL is not an MCP HTTP endpoint. This project does not expose MCP at `/mcp` or `/sse`; those paths are not part of its transport.
+The canvas server also serves MCP itself over Streamable HTTP at `/mcp` — see [Remote MCP over HTTP](#remote-mcp-over-http). There is no `/sse` endpoint.
 
 To keep a remote canvas on its default loopback-only binding, run the MCP process on your workstation and tunnel the canvas port to that machine:
 
@@ -309,11 +311,28 @@ Then configure the local MCP process against the local end of the tunnel. The UR
 
 Start the tunnel before the MCP client and leave it open while tools run. In this example the MCP process and browser run on the workstation, so both can use `http://127.0.0.1:13000`; the WebSocket also follows the page's host and port. `127.0.0.1` always means the machine or container running that process. If the MCP process runs in a container, the workstation's loopback tunnel is not that container's loopback: run the tunnel in the same network namespace as the MCP process, or configure a canvas address that is reachable from the container and protect any listener exposed beyond loopback.
 
-If an Open WebUI, LM Studio, or other MCP client setup accepts only HTTP-based MCP connections, it cannot use the canvas URL in place of MCP. It needs a separately configured stdio-to-HTTP MCP bridge in front of this stdio server; bridge setup and client transport support are outside this project.
+If an Open WebUI, LM Studio, or other MCP client accepts only HTTP-based MCP connections, point it at `http://<canvas>/mcp` instead of the canvas root URL.
 
 As a direct-LAN alternative, run the canvas process with an explicit non-loopback bind, for example from a built source checkout: `HOST=0.0.0.0 PORT=3000 node dist/server.js`. Then set the MCP process's `EXPRESS_SERVER_URL` to `http://canvas-host:3000`. The canvas container already binds `HOST=0.0.0.0`, and Compose publishes `3000:3000`; scope that port mapping or bind it to a trusted interface when possible. The CLI `start` command only auto-starts a loopback canvas, so it is not the way to create this LAN listener. The source default remains `HOST=127.0.0.1`.
 
 Direct LAN access exposes the canvas REST and WebSocket APIs, which have no built-in authentication and use permissive CORS middleware. Restrict that port to a trusted network/VPN with firewall or network-level access controls; do not expose it to the public internet.
+
+### Remote MCP over HTTP
+
+The canvas server (`node dist/server.js`, `npm run canvas`, or the canvas container) exposes the same 26 tools over [Streamable HTTP](https://modelcontextprotocol.io/specification/2026-07-28) at `/mcp`, next to the REST API and WebSocket. stdio (`dist/index.js`) is unchanged.
+
+- **Both protocol eras:** 2026-07-28 clients send stateless requests with the `_meta` envelope and the `Mcp-Method` / `Mcp-Name` headers; 2025-era clients (2025-11-25 and earlier) use the `initialize` handshake. 2025-era traffic is served statelessly: no `Mcp-Session-Id` is issued, and `GET`/`DELETE /mcp` answer `405`.
+- **Same canvas:** tools called over `/mcp` act on the canvas of the process that serves them, regardless of `EXPRESS_SERVER_URL`.
+- **DNS-rebinding protection:** on a loopback bind (the default `HOST=127.0.0.1`), `/mcp` rejects requests whose `Host` or `Origin` is not `localhost`, `127.0.0.1`, `[::1]`, or the hostname of `PUBLIC_BASE_URL` (`403`). Requests without `Origin` (non-browser clients) pass. The REST API is not affected.
+- **Reverse proxy:** set `PUBLIC_BASE_URL` to the public URL (the MCP endpoint is then `${PUBLIC_BASE_URL}/mcp`) and `TRUST_PROXY` (for example `loopback`) when the proxy runs on the same machine. An invalid `PUBLIC_BASE_URL` stops startup.
+
+```bash
+HOST=127.0.0.1 PORT=3000 node dist/server.js
+# MCP endpoint: http://127.0.0.1:3000/mcp
+claude mcp add --transport http excalidraw http://127.0.0.1:3000/mcp
+```
+
+`/mcp` has no authentication yet: it is exactly as open as the REST API on the same bind. Do not expose it beyond loopback or a trusted network until authentication lands.
 
 #### Durable canvas state
 
@@ -623,6 +642,18 @@ path.
 npm run test:mcp
 ```
 
+### MCP HTTP Wire Test
+
+Starts `dist/server.js` on a free loopback port and drives `/mcp` with raw HTTP
+in both eras (a 2025-11-25 `initialize` session and stateless 2026-07-28
+requests), checks that elements created over MCP are visible through the REST
+API, and that foreign `Host`/`Origin` headers and an invalid `PUBLIC_BASE_URL`
+are rejected.
+
+```bash
+npm run test:mcp-http
+```
+
 ### MCP Smoke Test (MCP Inspector)
 
 List tools:
@@ -701,7 +732,7 @@ Yes — that's the recommended path for coding agents: `npx -y mcp-excalidraw-se
 
 ### Can the MCP client and canvas run on different machines?
 
-Yes, if the MCP process can reach the canvas server. Keep the MCP process on the machine that launches it and set `EXPRESS_SERVER_URL` to that canvas location. The canvas HTTP/WebSocket URL is not an MCP endpoint; for an HTTP-only MCP client, configure a separate stdio-to-HTTP bridge. See [Remote Canvas and HTTP-Only MCP Clients](#remote-canvas-and-http-only-mcp-clients) for a loopback-preserving SSH tunnel and matching JSON configuration.
+Yes, if the MCP process can reach the canvas server. Keep the MCP process on the machine that launches it and set `EXPRESS_SERVER_URL` to that canvas location. An HTTP-only MCP client can instead connect straight to the canvas server's `/mcp` endpoint. See [Remote Canvas and HTTP-Only MCP Clients](#remote-canvas-and-http-only-mcp-clients) for a loopback-preserving SSH tunnel and matching JSON configuration.
 
 ## Troubleshooting
 

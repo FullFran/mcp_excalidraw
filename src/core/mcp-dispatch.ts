@@ -7,7 +7,7 @@ import {
   ServerElement,
   ExcalidrawElementType
 } from '../types.js';
-import { EXPRESS_SERVER_URL } from './config.js';
+import { canvasDisplayUrl } from './config.js';
 import {
   updateElementOnCanvas,
   deleteElementOnCanvas,
@@ -417,7 +417,7 @@ export async function callExcalidrawTool(
           return {
             content: [{
               type: 'text',
-              text: `Mermaid diagram sent for conversion!\n\n${JSON.stringify(result, null, 2)}\n\n⚠️  Note: The actual conversion happens in the frontend canvas with DOM access. Open the canvas at ${EXPRESS_SERVER_URL} to see the diagram rendered.`
+              text: `Mermaid diagram sent for conversion!\n\n${JSON.stringify(result, null, 2)}\n\n⚠️  Note: The actual conversion happens in the frontend canvas with DOM access. Open the canvas at ${canvasDisplayUrl()} to see the diagram rendered.`
             }]
           };
         } catch (error) {

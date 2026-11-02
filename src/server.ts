@@ -31,6 +31,8 @@ import WebSocket from 'ws';
 import { isMainModule } from './core/entry.js';
 import { writePidFile, removePidFile } from './core/pidfile.js';
 import { renderScene, RenderError, MAX_SCALE } from './core/render/index.js';
+import { resolvePublicBaseUrl, resolveTrustProxy, useInProcessCanvasUrl } from './core/config.js';
+import { createMcpHttpRouter, MCP_HTTP_PATH } from './core/mcp-http.js';
 import {
   CanvasFileImmutabilityError,
   CanvasFileReferenceError,
@@ -55,12 +57,37 @@ dotenv.config();
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+const PORT = parseInt(process.env.PORT || '3000', 10);
+const HOST = process.env.HOST || '127.0.0.1';
+
+// PUBLIC_BASE_URL is validated here but reported from startServer, so that
+// importing this module never throws and a bad value fails startup cleanly.
+let PUBLIC_BASE_URL: string | undefined;
+let publicBaseUrlError: Error | undefined;
+try {
+  PUBLIC_BASE_URL = resolvePublicBaseUrl();
+} catch (error) {
+  publicBaseUrlError = error as Error;
+}
+
 const app = express();
+// Off unless TRUST_PROXY says otherwise: X-Forwarded-* is only honoured
+// behind a reverse proxy the operator controls.
+app.set('trust proxy', resolveTrustProxy());
 const server = createServer(app);
 const wss = new WebSocketServer({ server });
 
 // Middleware
 app.use(cors());
+
+// MCP over Streamable HTTP. Mounted before the JSON body parser because the
+// SDK reads the raw body itself. Authentication (when added) plugs in through
+// the router's `authMiddleware` seam, in front of every MCP request.
+const { router: mcpRouter } = createMcpHttpRouter({
+  bindHost: HOST,
+  ...(PUBLIC_BASE_URL ? { publicBaseUrl: PUBLIC_BASE_URL } : {})
+});
+app.use(MCP_HTTP_PATH, mcpRouter);
 app.use(express.json({ limit: '10mb' }));
 
 // Serve static files from the build directory
@@ -1484,8 +1511,6 @@ app.use((err: Error, req: Request, res: Response, next: NextFunction) => {
 });
 
 // Start server
-const PORT = parseInt(process.env.PORT || '3000', 10);
-const HOST = process.env.HOST || '127.0.0.1';
 const LOOPBACK_GUARD_HOSTS = new Set(['localhost', '127.0.0.1', '::1', '0.0.0.0', '::']);
 const LOOPBACK_ADDRESSES = ['127.0.0.1', '::1'];
 
@@ -1542,7 +1567,18 @@ server.on('error', (error: NodeJS.ErrnoException) => {
   process.exit(1);
 });
 
+// The canvas server's own address as reachable from this process, for the
+// in-process MCP tools (wildcard binds are reached via loopback).
+function selfUrl(): string {
+  const host = HOST === '0.0.0.0' ? '127.0.0.1' : HOST === '::' ? '::1' : HOST;
+  return `http://${formatHostForUrl(host)}:${PORT}`;
+}
+
 async function startServer(): Promise<void> {
+  if (publicBaseUrlError) throw publicBaseUrlError;
+  // Tools invoked over /mcp must mutate this process's canvas, never one
+  // named by an inherited EXPRESS_SERVER_URL.
+  useInProcessCanvasUrl(selfUrl());
   acquireDurableStateLock();
   let durableState: ReturnType<typeof loadDurableState>;
   try {
@@ -1583,6 +1619,7 @@ async function startServer(): Promise<void> {
     const hostForUrl = formatHostForUrl(HOST);
     logger.info(`POC server running on http://${hostForUrl}:${PORT}`);
     logger.info(`WebSocket server running on ws://${hostForUrl}:${PORT}`);
+    logger.info(`MCP endpoint (Streamable HTTP) at ${PUBLIC_BASE_URL ?? `http://${hostForUrl}:${PORT}`}${MCP_HTTP_PATH}`);
 
     // Written only after listen succeeds so stale files can't shadow a
     // server that never came up; lets `excalidraw-canvas stop` find us.
