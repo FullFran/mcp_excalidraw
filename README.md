@@ -196,7 +196,7 @@ npx -y mcp-excalidraw-server install-skill --dir <skills-root>
 npx -y mcp-excalidraw-server install-skill --print-source  # inspect bundled source path
 ```
 
-> **Security note:** The canvas server binds `127.0.0.1` only by default. If you expose it on a network interface (`HOST=0.0.0.0`), put network-level access controls in front — the API has no built-in authentication.
+> **Security note:** The canvas server binds `127.0.0.1` only by default, with no authentication. On any other bind (`HOST=0.0.0.0`) or with `AUTH_MODE=oauth` it requires OAuth 2.1 with GitHub sign-in for `/mcp`, the canvas, the REST API and the WebSocket, and refuses to start until it is configured. See [docs/auth.md](docs/auth.md).
 
 ## Agent Skill
 
@@ -272,6 +272,7 @@ The MCP server runs over stdio. Since v1.1 the simplest config is `npx` — no c
 | `EXCALIDRAW_SHARE_BASE_URL` | Excalidraw app that share links open in | `https://excalidraw.com` |
 | `PORT` / `HOST` | Canvas server bind address | `3000` / `127.0.0.1` |
 | `PUBLIC_BASE_URL` | Public URL of the canvas server behind a reverse proxy (e.g. `https://board.example.com`); used for absolute URLs and allowed through the `/mcp` Host/Origin check | (unset) |
+| `AUTH_MODE` | `oauth` forces authentication on; `off` disables it (refused on non-loopback binds unless `ALLOW_INSECURE_NO_AUTH=true`). Other auth variables: [docs/auth.md](docs/auth.md) | (unset; off on loopback, required elsewhere) |
 | `TRUST_PROXY` | Express `trust proxy` setting: `true`, a hop count, or an address list such as `loopback` | (unset; off) |
 | `LOG_LEVEL` | Log verbosity (`error`, `warn`, `info`, `debug`) | `info` |
 | `LOG_FILE_PATH` | Log file location | `~/Library/Logs/excalidraw-mcp.log` (macOS), `$XDG_STATE_HOME/excalidraw-mcp/excalidraw.log` (Linux), `%LOCALAPPDATA%\Excalidraw-MCP\excalidraw.log` (Windows) |
@@ -332,7 +333,7 @@ HOST=127.0.0.1 PORT=3000 node dist/server.js
 claude mcp add --transport http excalidraw http://127.0.0.1:3000/mcp
 ```
 
-`/mcp` has no authentication yet: it is exactly as open as the REST API on the same bind. Do not expose it beyond loopback or a trusted network until authentication lands.
+On the default loopback bind `/mcp` has no authentication, like the REST API. When the server is exposed, `/mcp` is an OAuth 2.1 protected resource (PKCE, Client ID Metadata Documents and Dynamic Client Registration) — see [docs/auth.md](docs/auth.md) for the setup and for connecting ChatGPT, Claude Code and Codex.
 
 #### Durable canvas state
 
@@ -652,6 +653,14 @@ are rejected.
 
 ```bash
 npm run test:mcp-http
+```
+
+### Authentication Test
+
+Checks the startup rules (loopback stays open, other binds refuse to start without configuration), the full OAuth flow against a real server with a fake GitHub (DCR, PKCE, consent, `iss`, refresh rotation and family revocation), Client ID Metadata Documents against a fake https host, the SSRF guard, and the gate on the canvas, REST API and WebSocket.
+
+```bash
+npm run test:auth
 ```
 
 ### MCP Smoke Test (MCP Inspector)

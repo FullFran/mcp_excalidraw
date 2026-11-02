@@ -1,6 +1,6 @@
 import logger from '../utils/logger.js';
 import { ServerElement, ExportImageOptions } from '../types.js';
-import { EXPRESS_SERVER_URL, ENABLE_CANVAS_SYNC } from './config.js';
+import { EXPRESS_SERVER_URL, ENABLE_CANVAS_SYNC, withCanvasHeaders } from './config.js';
 
 // API Response types
 export interface ApiResponse {
@@ -78,7 +78,7 @@ export async function syncToCanvas(operation: string, data: any): Promise<SyncRe
     await assertCanvasIdentity();
 
     logger.debug(`Syncing to canvas: ${operation}`, { url, data });
-    const response = await fetch(url, options);
+    const response = await fetch(url, withCanvasHeaders(options));
 
     // Parse JSON response regardless of HTTP status
     const result = await response.json() as ApiResponse;
@@ -146,7 +146,7 @@ export async function getElementFromCanvas(elementId: string): Promise<ServerEle
 
   try {
     await assertCanvasIdentity();
-    const response = await fetch(`${EXPRESS_SERVER_URL}/api/elements/${elementId}`);
+    const response = await fetch(`${EXPRESS_SERVER_URL}/api/elements/${elementId}`, withCanvasHeaders());
     if (!response.ok) {
       logger.warn(`Failed to fetch element ${elementId}: ${response.status}`);
       return null;
@@ -163,7 +163,7 @@ export async function getElementFromCanvas(elementId: string): Promise<ServerEle
 
 async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
   await assertCanvasIdentity();
-  const response = await fetch(`${EXPRESS_SERVER_URL}${path}`, init);
+  const response = await fetch(`${EXPRESS_SERVER_URL}${path}`, withCanvasHeaders(init));
   const data = await response.json().catch(() => null) as any;
   if (!response.ok) {
     throw new Error(data?.error || `HTTP server error: ${response.status} ${response.statusText}`);

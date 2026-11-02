@@ -10,8 +10,22 @@ dotenv.config();
 // mutate the same in-memory canvas the REST API serves.
 export let EXPRESS_SERVER_URL = process.env.EXPRESS_SERVER_URL || 'http://127.0.0.1:3000';
 
-export function useInProcessCanvasUrl(url: string): void {
+// Extra headers for every request to EXPRESS_SERVER_URL. Empty unless the
+// canvas server hosts the tools itself with authentication on: then it hands
+// the in-process tools a per-process credential so they can reach `/api/*`.
+let canvasHeaders: Record<string, string> = {};
+
+export function useInProcessCanvasUrl(url: string, internalHeaders: Record<string, string> = {}): void {
   EXPRESS_SERVER_URL = url.replace(/\/+$/, '');
+  canvasHeaders = { ...internalHeaders };
+}
+
+/** Merges the in-process credential (if any) into a request's headers. */
+export function withCanvasHeaders(init: RequestInit = {}): RequestInit {
+  if (Object.keys(canvasHeaders).length === 0) return init;
+  const headers = new Headers(init.headers);
+  for (const [name, value] of Object.entries(canvasHeaders)) headers.set(name, value);
+  return { ...init, headers };
 }
 export const ENABLE_CANVAS_SYNC = process.env.ENABLE_CANVAS_SYNC !== 'false'; // Default to true
 

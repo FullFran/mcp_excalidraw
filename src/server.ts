@@ -33,6 +33,8 @@ import { writePidFile, removePidFile } from './core/pidfile.js';
 import { renderScene, RenderError, MAX_SCALE } from './core/render/index.js';
 import { resolvePublicBaseUrl, resolveTrustProxy, useInProcessCanvasUrl } from './core/config.js';
 import { createMcpHttpRouter, MCP_HTTP_PATH } from './core/mcp-http.js';
+import { createAuth, resolveAuthConfig, INTERNAL_AUTH_HEADER } from './auth/index.js';
+import type { Auth, AuthConfig } from './auth/index.js';
 import {
   CanvasFileImmutabilityError,
   CanvasFileReferenceError,
@@ -70,22 +72,51 @@ try {
   publicBaseUrlError = error as Error;
 }
 
+// Authentication (docs/auth.md): off on a loopback bind unless AUTH_MODE=oauth,
+// required on any other bind. Like PUBLIC_BASE_URL, a bad configuration is
+// captured here and fails startServer, so importing this module never throws.
+let authConfig: AuthConfig | undefined;
+let auth: Auth | undefined;
+let authConfigError: Error | undefined;
+try {
+  authConfig = resolveAuthConfig(HOST);
+  if (authConfig.mode === 'oauth') auth = createAuth(authConfig);
+} catch (error) {
+  authConfigError = error as Error;
+}
+
 const app = express();
 // Off unless TRUST_PROXY says otherwise: X-Forwarded-* is only honoured
 // behind a reverse proxy the operator controls.
 app.set('trust proxy', resolveTrustProxy());
 const server = createServer(app);
-const wss = new WebSocketServer({ server });
+const wss = new WebSocketServer({
+  server,
+  ...(auth ? {
+    verifyClient: (info: { req: import('http').IncomingMessage }, callback: (ok: boolean, code?: number, message?: string) => void) => {
+      const verdict = auth!.verifyWebSocket(info.req);
+      if (verdict.ok) callback(true);
+      else callback(false, verdict.status, verdict.message);
+    }
+  } : {})
+});
 
 // Middleware
 app.use(cors());
+if (auth) {
+  // OAuth metadata + endpoints first, then the gate in front of the canvas
+  // page, static assets and /api/* (the /mcp bearer check is in its router).
+  app.use(auth.router);
+  app.use(auth.protect);
+}
 
 // MCP over Streamable HTTP. Mounted before the JSON body parser because the
 // SDK reads the raw body itself. Authentication (when added) plugs in through
 // the router's `authMiddleware` seam, in front of every MCP request.
 const { router: mcpRouter } = createMcpHttpRouter({
   bindHost: HOST,
-  ...(PUBLIC_BASE_URL ? { publicBaseUrl: PUBLIC_BASE_URL } : {})
+  ...(PUBLIC_BASE_URL ? { publicBaseUrl: PUBLIC_BASE_URL } : {}),
+  ...(auth ? { authMiddleware: [auth.mcpBearer] } : {})
 });
 app.use(MCP_HTTP_PATH, mcpRouter);
 app.use(express.json({ limit: '10mb' }));
@@ -1469,6 +1500,12 @@ app.get('/', (req: Request, res: Response) => {
 
 // Health check endpoint
 app.get('/health', (req: Request, res: Response) => {
+  if (auth) {
+    // Unauthenticated when auth is on: identify the service, reveal nothing
+    // about the canvas or the process.
+    res.json({ status: 'healthy', service: 'mcp-excalidraw-canvas' });
+    return;
+  }
   res.json({
     status: 'healthy',
     timestamp: new Date().toISOString(),
@@ -1576,9 +1613,17 @@ function selfUrl(): string {
 
 async function startServer(): Promise<void> {
   if (publicBaseUrlError) throw publicBaseUrlError;
+  if (authConfigError) throw authConfigError;
+  if (authConfig?.mode === 'off' && authConfig.insecure) {
+    logger.warn(
+      `Authentication is OFF on non-loopback HOST=${HOST} (ALLOW_INSECURE_NO_AUTH=true): ` +
+      'anyone who can reach this address can read and change the canvas.'
+    );
+  }
   // Tools invoked over /mcp must mutate this process's canvas, never one
-  // named by an inherited EXPRESS_SERVER_URL.
-  useInProcessCanvasUrl(selfUrl());
+  // named by an inherited EXPRESS_SERVER_URL. With auth on they carry a
+  // per-process credential, since /api/* is gated.
+  useInProcessCanvasUrl(selfUrl(), auth ? { [INTERNAL_AUTH_HEADER]: auth.internalToken } : {});
   acquireDurableStateLock();
   let durableState: ReturnType<typeof loadDurableState>;
   try {
@@ -1620,6 +1665,9 @@ async function startServer(): Promise<void> {
     logger.info(`POC server running on http://${hostForUrl}:${PORT}`);
     logger.info(`WebSocket server running on ws://${hostForUrl}:${PORT}`);
     logger.info(`MCP endpoint (Streamable HTTP) at ${PUBLIC_BASE_URL ?? `http://${hostForUrl}:${PORT}`}${MCP_HTTP_PATH}`);
+    if (authConfig?.mode === 'oauth') {
+      logger.info(`OAuth enabled: issuer ${authConfig.issuer}, ${authConfig.allowedLogins.size} allowed GitHub login(s)`);
+    }
 
     // Written only after listen succeeds so stale files can't shadow a
     // server that never came up; lets `excalidraw-canvas stop` find us.

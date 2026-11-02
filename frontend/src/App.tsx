@@ -310,6 +310,11 @@ function App(): JSX.Element {
     const generation = pauseSceneSync()
     try {
       const response = await fetch('/api/elements', { signal: AbortSignal.timeout(10000) })
+      if (response.status === 401) {
+        // Authenticated deployment and the session expired: log in again.
+        window.location.assign(`/oauth/login?return_to=${encodeURIComponent(window.location.pathname + window.location.search)}`)
+        return
+      }
       const result: ApiResponse = await response.json()
       if (generation !== sceneGenerationRef.current) return
       if (!response.ok || !result.success || !Array.isArray(result.elements)) {
