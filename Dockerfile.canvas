@@ -13,12 +13,10 @@
 #   fonts + assets       ~ 1 MB
 #
 # Two deliberate deviations, with why:
-#   1. @modelcontextprotocol/* (~20 MB) is removed from node_modules in
-#      stage 2. Only dist/index.js (the stdio MCP entry — never executed
-#      in this image) imports it; dist/server.js and its full import
-#      closure do not. Stage 3 runs a smoke test that fails the build if
-#      the server actually needs it. (It remains in the MCP image, which
-#      is built from ./Dockerfile — this change does not touch it.)
+#   1. @modelcontextprotocol/* used to be removed from node_modules here,
+#      because only the stdio entry imported it. The canvas server now
+#      serves MCP over Streamable HTTP at /mcp (src/core/mcp-http.ts), so
+#      the SDK stays, and stage 3 checks that it loads.
 #   2. Runtime base is alpine + `apk add nodejs`, not node:20-alpine.
 #      The node:20-alpine image is ~190 MB, and its npm/corepack/yarn stack
 #      is never invoked by this image at runtime (the package is prebuilt
@@ -77,7 +75,7 @@ RUN npm run build:server
 #   - prune guarantees only manifest `dependencies` remain on disk
 #     (npm ci --omit=dev does this too, but the builder just ran a full
 #     `npm ci`, so prune is what enforces it now).
-#   - drop @modelcontextprotocol (see header note 2)
+#   - keep @modelcontextprotocol: /mcp needs it (see header note 1)
 #   - resvg's native prebuild must match the runtime libc. Stage 3 is musl,
 #     but this glibc build host only ever installs the -gnu prebuild for
 #     @resvg/resvg-js (its optionalDependencies resolve to the local libc).
@@ -91,7 +89,6 @@ RUN VERS=$(node -p "require('./node_modules/@resvg/resvg-js/package.json').versi
     ARCH=$(case "$(uname -m)" in x86_64) echo x64 ;; aarch64) echo arm64 ;; *) echo "unsupported" ;; esac) && \
     [ "$ARCH" != "unsupported" ] && \
     npm prune --omit=dev && npm cache clean --force && \
-    rm -rf node_modules/@modelcontextprotocol && \
     rm -f  node_modules/@resvg/resvg-js/resvgjs.*.node && \
     rm -rf node_modules/@resvg/resvg-js-linux-x64-gnu node_modules/@resvg/resvg-js-linux-arm64-gnu && \
     apt-get update -qq && apt-get install -y -qq --no-install-recommends curl ca-certificates >/dev/null && \
@@ -123,12 +120,17 @@ WORKDIR /app
 
 # Own the workdir up front so everything copied in is owned by nodejs and
 # no `chown -R` layer (which would duplicate node_modules) is produced.
-RUN chown nodejs:nodejs /app
+RUN chown nodejs:nodejs /app && \
+    mkdir -p /data && chown nodejs:nodejs /data
 USER nodejs
+
+# Durable state (boards, OAuth store, generated signing secret). Mount a
+# volume here and set EXCALIDRAW_DATA_DIR=/data when auth is on.
+VOLUME ["/data"]
 
 # Compiled backend (MCP entry, server, headless renderer, CLI)
 COPY --chown=nodejs:nodejs --from=backend-builder /app/dist ./dist
-# Production dependencies (no devDeps, no MCP SDK, musl resvg prebuild)
+# Production dependencies (no devDeps; MCP SDK kept for /mcp; musl resvg prebuild)
 COPY --chown=nodejs:nodejs --from=backend-builder /app/node_modules ./node_modules
 COPY --chown=nodejs:nodejs --from=backend-builder /app/package.json ./package.json
 # Built frontend (the canvas web UI on :3000)
@@ -146,7 +148,8 @@ RUN node --check dist/server.js && node -e "\
     if (!fs.existsSync('dist/render/excalidraw-node.mjs')) throw new Error('missing dist/render/excalidraw-node.mjs');\
     // web UI present\
     if (!fs.existsSync('dist/frontend/index.html')) throw new Error('missing dist/frontend/index.html');\
-    console.log('canvas smoke: resvg + bundle + frontend OK')"
+    console.log('canvas smoke: resvg + bundle + frontend OK')" && \
+    node --input-type=module -e "await import('@modelcontextprotocol/server'); console.log('canvas smoke: MCP SDK for /mcp OK')"
 
 # TTFs for headless PNG/SVG rendering (resvg reads TTF only, not WOFF2)
 COPY --chown=nodejs:nodejs assets ./assets

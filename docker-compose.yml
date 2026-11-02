@@ -17,12 +17,18 @@ services:
       dockerfile: Dockerfile.canvas
     image: mcp-excalidraw-canvas:latest
     container_name: mcp-excalidraw-canvas
+    # Published on the host's loopback only. Inside the container the server
+    # must listen on 0.0.0.0, which requires auth unless explicitly waived;
+    # the waiver is safe here only because the host side is 127.0.0.1.
+    # For a public deployment use compose.dokploy.yml (docs/auth.md).
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     environment:
       - NODE_ENV=production
       - PORT=3000
       - HOST=0.0.0.0
+      - AUTH_MODE=off
+      - ALLOW_INSECURE_NO_AUTH=true
       - DEBUG=false
     restart: unless-stopped
     healthcheck:

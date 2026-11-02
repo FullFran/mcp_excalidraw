@@ -19,7 +19,7 @@ Branch: `feat/remote-whiteboard` (work units merged to `main` of FullFran/mcp_ex
 | T2 | S3 | delegated (writer trigger b: long-session context backstop) | done | 36b0d77; independent verification found B1, fixed in 220abe1 |
 | T2b | S3 (device flow) | delegated (writer trigger b: long-session context backstop) | done | 220abe1 + B2 fix; independent verification B1 closed, B2 fixed and pinned |
 | T3 | S4 | pending | pending | |
-| T4 | S5 | pending | blocked: needs VPS authorization | |
+| T4 | S5 | inline | in progress | image built and run locally with auth on: /health 200, /mcp 401, /api 401, canvas 302, auth-secret 0600 nodejs; Dockerfile keeps MCP SDK (smoke OK) |
 
 ## Log
 

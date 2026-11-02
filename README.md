@@ -314,7 +314,7 @@ Start the tunnel before the MCP client and leave it open while tools run. In thi
 
 If an Open WebUI, LM Studio, or other MCP client accepts only HTTP-based MCP connections, point it at `http://<canvas>/mcp` instead of the canvas root URL.
 
-As a direct-LAN alternative, run the canvas process with an explicit non-loopback bind, for example from a built source checkout: `HOST=0.0.0.0 PORT=3000 node dist/server.js`. Then set the MCP process's `EXPRESS_SERVER_URL` to `http://canvas-host:3000`. The canvas container already binds `HOST=0.0.0.0`, and Compose publishes `3000:3000`; scope that port mapping or bind it to a trusted interface when possible. The CLI `start` command only auto-starts a loopback canvas, so it is not the way to create this LAN listener. The source default remains `HOST=127.0.0.1`.
+As a direct-LAN alternative, run the canvas process with an explicit non-loopback bind. A non-loopback bind requires authentication (see [docs/auth.md](docs/auth.md)); to run it without, you must opt out explicitly: `HOST=0.0.0.0 PORT=3000 AUTH_MODE=off ALLOW_INSECURE_NO_AUTH=true node dist/server.js`. Then set the MCP process's `EXPRESS_SERVER_URL` to `http://canvas-host:3000`. The canvas container binds `HOST=0.0.0.0`; the bundled Compose file publishes it on `127.0.0.1:3000` only and waives auth for that reason. For a public deployment use `compose.dokploy.yml`, which keeps auth on. The CLI `start` command only auto-starts a loopback canvas, so it is not the way to create this LAN listener. The source default remains `HOST=127.0.0.1`.
 
 Direct LAN access exposes the canvas REST and WebSocket APIs, which have no built-in authentication and use permissive CORS middleware. Restrict that port to a trusted network/VPN with firewall or network-level access controls; do not expose it to the public internet.
 
@@ -582,10 +582,13 @@ node dist/index.js                # MCP server over stdio (terminal 2, usually l
 node dist/bin.js status           # or drive the CLI straight from the build
 ```
 
-Docker canvas server:
+Docker canvas server (local only: the container listens on 0.0.0.0, so auth is required unless waived; publish it on loopback when you waive it):
 ```bash
-docker run -d -p 3000:3000 --name mcp-excalidraw-canvas ghcr.io/yctimlin/mcp_excalidraw-canvas:latest
+docker run -d -p 127.0.0.1:3000:3000 -e AUTH_MODE=off -e ALLOW_INSECURE_NO_AUTH=true \
+  --name mcp-excalidraw-canvas ghcr.io/yctimlin/mcp_excalidraw-canvas:latest
 ```
+
+Public, authenticated deployment (Dokploy, Coolify, plain Compose behind a TLS proxy): see `compose.dokploy.yml` and [docs/auth.md](docs/auth.md).
 
 MCP server image: `ghcr.io/yctimlin/mcp_excalidraw:latest` (stdio; point `EXPRESS_SERVER_URL` at the canvas container).
 

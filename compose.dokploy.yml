@@ -1,0 +1,44 @@
+# Remote, authenticated whiteboard behind Dokploy's Traefik.
+#
+# Dokploy builds this file from the repository and adds the Traefik labels
+# for the domain configured in its UI/API, so no ports are published here.
+# No secret is needed: GitHub sign-in uses the device flow (public client ID
+# only) and the session-signing secret is generated on first start inside
+# the data volume (mode 0600). See docs/auth.md.
+#
+# Set in Dokploy's environment (none of them is secret):
+#   PUBLIC_BASE_URL       e.g. https://pizarra.fullfran.com
+#   GITHUB_CLIENT_ID      the OAuth App's client ID, with Device Flow enabled
+#   ALLOWED_GITHUB_LOGINS e.g. FullFran
+
+services:
+  pizarra:
+    build:
+      context: .
+      dockerfile: Dockerfile.canvas
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: "3000"
+      AUTH_MODE: oauth
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:?set PUBLIC_BASE_URL}
+      GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID:?set GITHUB_CLIENT_ID}
+      ALLOWED_GITHUB_LOGINS: ${ALLOWED_GITHUB_LOGINS:?set ALLOWED_GITHUB_LOGINS}
+      EXCALIDRAW_DATA_DIR: /data
+      # One reverse proxy (Traefik) in front: trust it for the client IP
+      # (rate limits) and the original scheme (Secure cookies).
+      TRUST_PROXY: "1"
+    volumes:
+      - pizarra-data:/data
+    expose:
+      - "3000"
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://127.0.0.1:3000/health', (r) => process.exit(r.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+volumes:
+  pizarra-data:
