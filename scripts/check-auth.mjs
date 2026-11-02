@@ -614,6 +614,20 @@ async function checkRealServerFlow(github) {
     assert(!existsSync(join(dataDir, 'auth-secret')), 'an explicit AUTH_SECRET wins over the generated one');
     ok('device flow: login page -> code + app name + warning -> GitHub approval -> session; authorize request preserved');
 
+    // B2: browsers drop tab/newline from URLs and treat "\" like "/", so these
+    // would become "//evil.example" in location.assign. They must fall back to "/".
+    const offSite = ['/\t/evil.example/phish', '/\n/evil.example/phish', '/\r/evil.example', '/\t\\evil.example', '/\\evil.example', '/%09/evil.example'];
+    for (const [i, returnTo] of offSite.entries()) {
+      const attempt = await githubLogin(base, github, 'FullFran', returnTo, `198.51.100.${60 + i}`);
+      assertEqual(attempt.poll.status, 200, `device poll for return_to ${JSON.stringify(returnTo)}`);
+      const redirect = JSON.parse(attempt.poll.text).redirect;
+      assert(typeof redirect === 'string' && !/[\u0000-\u001f\u007f\\]/.test(redirect) && new URL(redirect, base).origin === new URL(base).origin,
+        `return_to ${JSON.stringify(returnTo)} must stay on our origin, got ${JSON.stringify(redirect)}`);
+    }
+    const kept = await githubLogin(base, github, 'FullFran', '/oauth/authorize?client_id=x&state=y', '198.51.100.70');
+    assertEqual(JSON.parse(kept.poll.text).redirect, '/oauth/authorize?client_id=x&state=y', 'a normal same-origin return_to is kept');
+    ok('return_to with control characters or backslashes cannot leave our origin (device poll redirect)');
+
     await checkDeviceEdgeCases(base, github);
 
     // --- consent ---

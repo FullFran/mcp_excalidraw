@@ -107,7 +107,7 @@ export const DEVICE_SCRIPT = `(() => {
     } catch {
       result = { status: 'pending' };
     }
-    if (result && result.status === 'complete' && typeof result.redirect === 'string' && result.redirect.startsWith('/') && !result.redirect.startsWith('//')) {
+    if (result && result.status === 'complete' && typeof result.redirect === 'string' && result.redirect.startsWith('/') && !/[\\u0000-\\u001f\\u007f\\\\]/.test(result.redirect) && new URL(result.redirect, window.location.origin).origin === window.location.origin) {
       window.location.assign(result.redirect);
       return;
     }

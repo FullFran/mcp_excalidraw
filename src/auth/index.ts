@@ -129,9 +129,23 @@ function bearerToken(header: string | undefined): string | undefined {
 }
 
 /** Same-origin relative path, to avoid an open redirect through `return_to`. */
+/**
+ * A same-origin path to go back to after sign-in, or "/". Browsers drop ASCII
+ * tab/CR/LF from URLs and treat "\" like "/", so "/\t/evil" or "/\evil" would
+ * navigate off-site through location.assign; anything with control characters
+ * or backslashes is refused, and the result must resolve to our own origin.
+ */
 function safeReturnPath(value: string | undefined): string {
-  if (!value || !value.startsWith('/') || value.startsWith('//') || value.startsWith('/\\') || value.length > 4096) return '/';
-  return value;
+  if (!value || value.length > 4096 || !value.startsWith('/') || value.startsWith('//')) return '/';
+  if (/[\u0000-\u001f\u007f\\]/.test(value)) return '/';
+  try {
+    const base = new URL('https://return-path.invalid');
+    const resolved = new URL(value, base);
+    if (resolved.origin !== base.origin) return '/';
+    return `${resolved.pathname}${resolved.search}${resolved.hash}`;
+  } catch {
+    return '/';
+  }
 }
 
 function oauthError(res: Response, status: number, error: string, description: string, extraHeaders: Record<string, string> = {}): void {
