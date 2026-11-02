@@ -7,7 +7,7 @@ import type { LookupFunction } from 'node:net';
  * Address ranges an outbound fetch of a client-supplied URL must never reach:
  * loopback, private, link-local, CGNAT, documentation, multicast, reserved,
  * and their IPv6 equivalents. IPv4-mapped IPv6 addresses are unwrapped and
- * checked as IPv4.
+ * checked as IPv4; IPv4-compatible ones (`::a.b.c.d`) are all refused.
  */
 const BLOCKED = new BlockList();
 for (const [network, prefix] of [
@@ -18,7 +18,8 @@ for (const [network, prefix] of [
   BLOCKED.addSubnet(network, prefix, 'ipv4');
 }
 for (const [network, prefix] of [
-  ['::', 128], ['::1', 128], ['64:ff9b::', 96], ['64:ff9b:1::', 48], ['100::', 64], ['2001::', 23],
+  // ::/96 also covers the deprecated IPv4-compatible form (`::127.0.0.1`).
+  ['::', 96], ['::1', 128], ['64:ff9b::', 96], ['64:ff9b:1::', 48], ['100::', 64], ['2001::', 23],
   ['2001:db8::', 32], ['2002::', 16], ['fc00::', 7], ['fe80::', 10], ['fec0::', 10], ['ff00::', 8]
 ] as const) {
   BLOCKED.addSubnet(network, prefix, 'ipv6');

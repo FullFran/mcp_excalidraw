@@ -13,7 +13,7 @@
 import { spawn } from 'node:child_process';
 import http from 'node:http';
 import net from 'node:net';
-import { mkdtempSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -37,6 +37,16 @@ const PUBLIC_HOST = 'board.example.test';
 
 // Scratch state (logs, pidfiles) lives outside the repository.
 const scratch = mkdtempSync(join(tmpdir(), 'mcp-http-check-'));
+
+// Every spawned canvas is tracked and killed when this script exits, even
+// when a check throws, so a failing run never leaks a dist/server.js.
+const spawned = new Set();
+function killAll() {
+  for (const child of spawned) {
+    if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+  }
+}
+process.on('exit', killAll);
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);
@@ -77,6 +87,8 @@ function spawnCanvas(port, extraEnv = {}) {
   Object.assign(env, extraEnv);
 
   const child = spawn(runtime, runtimeArgs, { cwd: scratch, env, stdio: ['ignore', 'pipe', 'pipe'] });
+  spawned.add(child);
+  child.once('exit', () => spawned.delete(child));
   let output = '';
   child.stdout.on('data', chunk => { output += chunk.toString(); });
   child.stderr.on('data', chunk => { output += chunk.toString(); });
@@ -103,7 +115,7 @@ async function waitForHealth(baseUrl, canvas) {
 function waitForExit(child, timeoutMs = STARTUP_TIMEOUT_MS) {
   return new Promise((resolve, reject) => {
     if (child.exitCode !== null) return resolve(child.exitCode);
-    const timer = setTimeout(() => reject(new Error('process did not exit')), timeoutMs);
+    const timer = setTimeout(() => { child.kill('SIGKILL'); reject(new Error('process did not exit')); }, timeoutMs);
     child.once('exit', code => { clearTimeout(timer); resolve(code); });
   });
 }
@@ -355,7 +367,12 @@ async function checkPublicBaseUrl() {
 async function checkInvalidPublicBaseUrl() {
   const port = await freePort();
   const canvas = spawnCanvas(port, { PUBLIC_BASE_URL: 'ftp://not-http.example' });
-  const code = await waitForExit(canvas.child);
+  let code;
+  try {
+    code = await waitForExit(canvas.child);
+  } finally {
+    if (canvas.child.exitCode === null) canvas.child.kill('SIGKILL');
+  }
   assert(code !== 0, `invalid PUBLIC_BASE_URL: expected a non-zero exit, got ${code}`);
   assert(canvas.output().includes('PUBLIC_BASE_URL'), `invalid PUBLIC_BASE_URL: error must name the variable, got ${JSON.stringify(canvas.output())}`);
 }
@@ -398,11 +415,14 @@ async function main() {
     canvas.child.kill('SIGKILL');
   }
 
-  console.log(`scratch: ${scratch}`);
+  killAll();
   if (failed > 0) {
+    // Scratch is kept on failure for the logs.
+    console.error(`scratch kept: ${scratch}`);
     console.error(`${failed} of ${checks.length} HTTP MCP wire checks failed.`);
     process.exit(1);
   }
+  rmSync(scratch, { recursive: true, force: true });
   console.log(`All ${checks.length} HTTP MCP wire checks passed using ${runtimeName}.`);
 }
 

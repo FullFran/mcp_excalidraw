@@ -196,7 +196,7 @@ npx -y mcp-excalidraw-server install-skill --dir <skills-root>
 npx -y mcp-excalidraw-server install-skill --print-source  # inspect bundled source path
 ```
 
-> **Security note:** The canvas server binds `127.0.0.1` only by default, with no authentication. On any other bind (`HOST=0.0.0.0`) or with `AUTH_MODE=oauth` it requires OAuth 2.1 with GitHub sign-in for `/mcp`, the canvas, the REST API and the WebSocket, and refuses to start until it is configured. See [docs/auth.md](docs/auth.md).
+> **Security note:** The canvas server binds `127.0.0.1` only by default, with no authentication. On any other bind (`HOST=0.0.0.0`) or with `AUTH_MODE=oauth` it requires OAuth 2.1 with GitHub sign-in (device flow: only a public client ID, no client secret) for `/mcp`, the canvas, the REST API and the WebSocket, and refuses to start until it is configured. The session-signing secret is generated in the data directory on first start. See [docs/auth.md](docs/auth.md).
 
 ## Agent Skill
 
@@ -657,7 +657,7 @@ npm run test:mcp-http
 
 ### Authentication Test
 
-Checks the startup rules (loopback stays open, other binds refuse to start without configuration), the full OAuth flow against a real server with a fake GitHub (DCR, PKCE, consent, `iss`, refresh rotation and family revocation), Client ID Metadata Documents against a fake https host, the SSRF guard, and the gate on the canvas, REST API and WebSocket.
+Checks the startup rules (loopback stays open, other binds refuse to start without configuration), the generated signing secret (mode `0600`, reused across restarts), the full OAuth flow against a real server with a fake GitHub device flow (browser binding, `authorization_pending`, `slow_down`, expiry, denial, rate limit; DCR, PKCE, single-use consent, `iss`, refresh rotation and family revocation), Client ID Metadata Documents against a fake https host, the SSRF guard, and the gate on the canvas, REST API and WebSocket.
 
 ```bash
 npm run test:auth

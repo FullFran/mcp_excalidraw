@@ -2,21 +2,24 @@
 
 // Checks for authentication (docs/auth.md): OAuth 2.1 resource server on
 // /mcp, the built-in authorization server (DCR, CIMD, PKCE, refresh token
-// rotation, RFC 9207 `iss`), GitHub login with an allowlist, and the gate in
-// front of the canvas page, REST API and WebSocket.
+// rotation, RFC 9207 `iss`), GitHub login through the OAuth device flow with
+// an allowlist and browser binding, the generated signing secret, and the
+// gate in front of the canvas page, REST API and WebSocket.
 //
 // Real `dist/server.js` processes cover startup rules and the full DCR flow
 // on the wire. Client ID Metadata Documents, the SSRF guard, token expiry and
 // audience binding are driven in-process through `dist/auth/*.js`, where the
 // guard and CA can be injected (the server itself always uses the strict
-// public-address guard). A fake GitHub and a fake https CIMD host run on
-// random loopback ports. Scratch state lives outside the repository.
+// public-address guard). A fake GitHub (device flow endpoints) and a fake
+// https CIMD host run on random loopback ports. Scratch state lives outside
+// the repository and is removed on success; every spawned server is killed
+// when this script exits, even after a failure.
 
 import { spawn, execFileSync } from 'node:child_process';
 import http from 'node:http';
 import https from 'node:https';
 import net from 'node:net';
-import { mkdtempSync, mkdirSync, readFileSync, statSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -35,12 +38,28 @@ const WebSocket = require('ws');
 const MODERN_VERSION = '2026-07-28';
 const STARTUP_TIMEOUT_MS = 8000;
 const GH_CLIENT_ID = 'gh-test-client';
+// Only used to prove a leftover GITHUB_CLIENT_SECRET is ignored with a warning.
 const GH_CLIENT_SECRET = 'gh-test-secret';
+const GH_APP_NAME = 'Pizarra Test App';
+const DEVICE_WARNING = 'Only enter this code if you started this sign-in on this screen just now';
 const AUTH_SECRET = randomBytes(36).toString('base64');
 const ALLOWED_LOGIN = 'FullFran';
 
 const scratch = mkdtempSync(join(tmpdir(), 'mcp-auth-check-'));
 let passed = 0;
+
+// Every response body and header seen by the checks, to prove GitHub's
+// tokens and device codes never reach a client.
+const transcript = [];
+
+// Every spawned server is killed on exit, whatever happened.
+const spawned = new Set();
+function killAll() {
+  for (const child of spawned) {
+    if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+  }
+}
+process.on('exit', killAll);
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);
@@ -93,6 +112,7 @@ function request(base, { method = 'GET', path = '/', headers = {}, json, form } 
       res.on('end', () => {
         let body;
         try { body = JSON.parse(text); } catch { body = undefined; }
+        transcript.push(`${JSON.stringify(res.headers)}\n${text}`);
         resolve({ status: res.statusCode, headers: res.headers, text, body });
       });
     });
@@ -127,69 +147,144 @@ function pkcePair() {
 }
 
 // ---------------------------------------------------------------------------
-// Fake GitHub: codes are `code-<login>`; tokens are `tok-<login>`.
+// Fake GitHub: the OAuth device flow (RFC 8628 as GitHub implements it) and
+// GET /user. The test plays the human on GitHub with approve/deny/expire.
 // ---------------------------------------------------------------------------
+
+const DEVICE_GRANT = 'urn:ietf:params:oauth:grant-type:device_code';
 
 async function startFakeGitHub() {
   const port = await freePort();
+  const url = `http://127.0.0.1:${port}`;
+  const byUserCode = new Map();
+  const byDeviceCode = new Map();
+  const tokens = new Map();
+  const secrets = { deviceCodes: [], accessTokens: [] };
+  const stats = { codeRequests: 0, tokenPolls: 0, clientSecretSeen: false };
   const server = http.createServer((req, res) => {
     let raw = '';
     req.on('data', chunk => { raw += chunk; });
     req.on('end', () => {
-      const url = new URL(req.url, `http://127.0.0.1:${port}`);
-      if (req.method === 'POST' && url.pathname === '/login/oauth/access_token') {
-        const params = new URLSearchParams(raw);
+      const path = new URL(req.url, url).pathname;
+      const params = new URLSearchParams(raw);
+      const send = (body, status = 200) => {
+        res.statusCode = status;
         res.setHeader('content-type', 'application/json');
-        if (params.get('client_id') !== GH_CLIENT_ID || params.get('client_secret') !== GH_CLIENT_SECRET) {
-          res.end(JSON.stringify({ error: 'incorrect_client_credentials' }));
-          return;
-        }
-        const code = params.get('code') ?? '';
-        if (!code.startsWith('code-')) {
-          res.end(JSON.stringify({ error: 'bad_verification_code' }));
-          return;
-        }
-        res.end(JSON.stringify({ access_token: `tok-${code.slice(5)}`, token_type: 'bearer', scope: '' }));
-        return;
+        res.end(JSON.stringify(body));
+      };
+      if (params.has('client_secret')) stats.clientSecretSeen = true;
+      if (req.method === 'POST' && path === '/login/device/code') {
+        stats.codeRequests += 1;
+        if (params.get('client_id') !== GH_CLIENT_ID) return send({ error: 'incorrect_client_credentials' }, 400);
+        if (params.get('scope') !== 'read:user') return send({ error: 'invalid_scope', got: params.get('scope') }, 400);
+        const deviceCode = randomBytes(20).toString('hex');
+        const userCode = `${randomBytes(2).toString('hex')}-${randomBytes(2).toString('hex')}`.toUpperCase();
+        const state = { deviceCode, userCode, login: null, denied: false, expired: false, slowDown: false, interval: 1, polls: 0, used: false };
+        byUserCode.set(userCode, state);
+        byDeviceCode.set(deviceCode, state);
+        secrets.deviceCodes.push(deviceCode);
+        return send({ device_code: deviceCode, user_code: userCode, verification_uri: `${url}/login/device`, expires_in: 900, interval: 1 });
       }
-      if (req.method === 'GET' && url.pathname === '/user') {
-        const token = /^Bearer tok-(.+)$/.exec(req.headers.authorization ?? '')?.[1];
-        res.setHeader('content-type', 'application/json');
-        if (!token) {
-          res.statusCode = 401;
-          res.end(JSON.stringify({ message: 'Bad credentials' }));
-          return;
+      if (req.method === 'POST' && path === '/login/oauth/access_token') {
+        stats.tokenPolls += 1;
+        if (params.get('client_id') !== GH_CLIENT_ID) return send({ error: 'incorrect_client_credentials' });
+        if (params.get('grant_type') !== DEVICE_GRANT) return send({ error: 'unsupported_grant_type' });
+        const state = byDeviceCode.get(params.get('device_code') ?? '');
+        if (!state || state.used) return send({ error: 'incorrect_device_code' });
+        state.polls += 1;
+        if (state.expired) return send({ error: 'expired_token' });
+        if (state.denied) return send({ error: 'access_denied' });
+        if (state.slowDown) {
+          state.slowDown = false;
+          state.interval += 5;
+          return send({ error: 'slow_down', interval: state.interval });
         }
-        res.end(JSON.stringify({ login: token, id: 1 }));
-        return;
+        if (!state.login) return send({ error: 'authorization_pending' });
+        state.used = true;
+        const token = `gho_${randomBytes(18).toString('hex')}`;
+        tokens.set(token, state.login);
+        secrets.accessTokens.push(token);
+        return send({ access_token: token, token_type: 'bearer', scope: 'read:user' });
       }
-      res.statusCode = 404;
-      res.end('not found');
+      if (req.method === 'GET' && path === '/user') {
+        const token = /^Bearer (.+)$/.exec(req.headers.authorization ?? '')?.[1];
+        const login = token ? tokens.get(token) : undefined;
+        if (!login) return send({ message: 'Bad credentials' }, 401);
+        return send({ login, id: 1 });
+      }
+      send({ message: 'not found' }, 404);
     });
   });
   await new Promise(resolve => server.listen(port, '127.0.0.1', resolve));
-  return { url: `http://127.0.0.1:${port}`, close: () => new Promise(resolve => server.close(resolve)) };
+  const state = userCode => {
+    const found = byUserCode.get(userCode);
+    assert(found, `fake GitHub knows user code ${userCode}`);
+    return found;
+  };
+  return {
+    url,
+    stats,
+    secrets,
+    approve: (userCode, login) => { state(userCode).login = login; },
+    deny: userCode => { state(userCode).denied = true; },
+    expire: userCode => { state(userCode).expired = true; },
+    slowDown: userCode => { state(userCode).slowDown = true; },
+    polls: userCode => state(userCode).polls,
+    close: () => new Promise(resolve => server.close(resolve))
+  };
 }
 
 // ---------------------------------------------------------------------------
 // OAuth flow driver (works against the real server and the in-process app)
 // ---------------------------------------------------------------------------
 
-/** Logs in through the fake GitHub; returns the cookie jar holding the session. */
-async function githubLogin(base, githubUrl, login, returnTo = '/') {
-  const start = await request(base, { path: `/oauth/login?return_to=${encodeURIComponent(returnTo)}` });
-  assertEqual(start.status, 302, 'login redirects to GitHub');
-  const location = new URL(start.headers.location);
-  assertEqual(location.origin, new URL(githubUrl).origin, 'login goes to the configured GitHub');
-  assertEqual(location.searchParams.get('client_id'), GH_CLIENT_ID, 'GitHub client_id');
-  assertEqual(location.searchParams.get('redirect_uri'), `${base}/oauth/github/callback`, 'GitHub callback URL');
-  const state = location.searchParams.get('state');
-  const jar = setCookies(start);
-  const callback = await request(base, {
-    path: `/oauth/github/callback?code=code-${encodeURIComponent(login)}&state=${encodeURIComponent(state)}`,
-    headers: { cookie: cookieHeader(jar) }
+function decodeEntities(value) {
+  return value.replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+}
+
+const ipHeaders = ip => (ip ? { 'x-forwarded-for': ip } : {});
+
+/**
+ * Login page -> POST start -> device page. Returns the browser's cookie jar
+ * (holding the device-binding cookie), the page and the user code. `ip` is
+ * sent as X-Forwarded-For (the real server trusts loopback proxies in these
+ * checks), so per-IP rate limits can be exercised separately.
+ */
+async function startDeviceLogin(base, { returnTo = '/', ip } = {}) {
+  const loginPage = await request(base, { path: `/oauth/login?return_to=${encodeURIComponent(returnTo)}`, headers: ipHeaders(ip) });
+  assertEqual(loginPage.status, 200, 'login page');
+  const hidden = /name="return_to" value="([^"]*)"/.exec(loginPage.text)?.[1];
+  assert(hidden !== undefined, `login page carries return_to: ${loginPage.text.slice(0, 300)}`);
+  const started = await request(base, {
+    method: 'POST', path: '/oauth/login', headers: { origin: base, ...ipHeaders(ip) }, form: { return_to: decodeEntities(hidden) }
   });
-  return { callback, jar: { ...jar, ...setCookies(callback) }, state };
+  if (started.status !== 303) return { started };
+  assertEqual(started.headers.location, '/oauth/device', 'start redirects to the device page');
+  const jar = setCookies(started);
+  const devicePage = await request(base, { path: '/oauth/device', headers: { cookie: cookieHeader(jar), ...ipHeaders(ip) } });
+  assertEqual(devicePage.status, 200, `device page (${devicePage.text.slice(0, 300)})`);
+  const userCode = /class="user-code">([A-Z0-9-]+)</.exec(devicePage.text)?.[1];
+  assert(userCode, `device page shows the user code: ${devicePage.text.slice(0, 400)}`);
+  return { started, jar, devicePage, userCode, ip, loginPage };
+}
+
+function pollDevice(base, flow, { jar = flow.jar, origin = base } = {}) {
+  return request(base, {
+    method: 'POST',
+    path: '/oauth/device/poll',
+    headers: { accept: 'application/json', ...(jar ? { cookie: cookieHeader(jar) } : {}), ...(origin ? { origin } : {}), ...ipHeaders(flow.ip) }
+  });
+}
+
+/** Full device login as `login`; returns the poll response and the merged jar. */
+async function githubLogin(base, github, login, returnTo = '/', ip) {
+  const flow = await startDeviceLogin(base, { returnTo, ip });
+  assertEqual(flow.started.status, 303, `device login start (${flow.started.text.slice(0, 200)})`);
+  github.approve(flow.userCode, login);
+  // The server waits GitHub's `interval` (1 s in the fake) before polling.
+  await sleep(1100);
+  const poll = await pollDevice(base, flow);
+  return { poll, flow, jar: { ...flow.jar, ...setCookies(poll) } };
 }
 
 function sessionCookieName(jar) {
@@ -307,14 +402,16 @@ function spawnCanvas(port, extraEnv = {}) {
   for (const name of [
     'EXPRESS_SERVER_URL', 'PUBLIC_BASE_URL', 'TRUST_PROXY', 'EXCALIDRAW_DATA_DIR', 'AUTH_MODE', 'ALLOW_INSECURE_NO_AUTH',
     'GITHUB_CLIENT_ID', 'GITHUB_CLIENT_SECRET', 'GITHUB_CLIENT_SECRET_FILE', 'ALLOWED_GITHUB_LOGINS', 'AUTH_SECRET',
-    'AUTH_SECRET_FILE', 'GITHUB_OAUTH_BASE_URL', 'GITHUB_API_BASE_URL'
+    'AUTH_SECRET_FILE', 'GITHUB_OAUTH_BASE_URL', 'GITHUB_API_BASE_URL', 'GITHUB_APP_NAME'
   ]) delete env[name];
   Object.assign(env, extraEnv);
   const child = spawn(runtime, runtimeArgs, { cwd: scratch, env, stdio: ['ignore', 'pipe', 'pipe'] });
+  spawned.add(child);
+  child.once('exit', () => spawned.delete(child));
   let output = '';
   child.stdout.on('data', chunk => { output += chunk.toString(); });
   child.stderr.on('data', chunk => { output += chunk.toString(); });
-  return { child, output: () => output.trim() };
+  return { child, output: () => output.trim(), logFile: env.LOG_FILE_PATH };
 }
 
 async function waitForHealth(baseUrl, canvas) {
@@ -346,13 +443,19 @@ async function stop(canvas) {
   await waitForExit(canvas.child).catch(() => {});
 }
 
-async function expectStartupRefusal(label, env, mustMention) {
+async function expectStartupRefusal(label, env, mustMention, mustNotMention = []) {
   const port = await freePort();
   const canvas = spawnCanvas(port, env);
-  const code = await waitForExit(canvas.child);
+  let code;
+  try {
+    code = await waitForExit(canvas.child);
+  } finally {
+    await stop(canvas);
+  }
   assert(code !== 0, `${label}: expected a non-zero exit, got ${code}`);
   const log = canvas.output();
   for (const text of mustMention) assert(log.includes(text), `${label}: startup error should mention ${text}: ${log}`);
+  for (const text of mustNotMention) assert(!log.includes(text), `${label}: startup error should not mention ${text}: ${log}`);
   ok(label);
 }
 
@@ -361,12 +464,14 @@ function authEnv(port, githubUrl, dataDir, extra = {}) {
     AUTH_MODE: 'oauth',
     PUBLIC_BASE_URL: `http://127.0.0.1:${port}`,
     GITHUB_CLIENT_ID: GH_CLIENT_ID,
-    GITHUB_CLIENT_SECRET: GH_CLIENT_SECRET,
+    GITHUB_APP_NAME: GH_APP_NAME,
     GITHUB_OAUTH_BASE_URL: githubUrl,
     GITHUB_API_BASE_URL: githubUrl,
     ALLOWED_GITHUB_LOGINS: `someone-else, ${ALLOWED_LOGIN.toLowerCase()}`,
     AUTH_SECRET,
     EXCALIDRAW_DATA_DIR: dataDir,
+    // X-Forwarded-For from the checks picks the client IP for rate limits.
+    TRUST_PROXY: 'loopback',
     ...extra
   };
 }
@@ -396,12 +501,13 @@ async function checkDefaultLoopbackStaysOpen() {
 }
 
 async function checkStartupRules() {
+  // No GitHub client secret and no signing secret are required any more.
   await expectStartupRefusal('non-loopback bind without auth config refuses to start', { HOST: '0.0.0.0' },
-    ['PUBLIC_BASE_URL', 'GITHUB_CLIENT_ID', 'GITHUB_CLIENT_SECRET', 'ALLOWED_GITHUB_LOGINS', 'AUTH_SECRET', 'EXCALIDRAW_DATA_DIR']);
+    ['PUBLIC_BASE_URL', 'GITHUB_CLIENT_ID', 'ALLOWED_GITHUB_LOGINS', 'EXCALIDRAW_DATA_DIR'], ['GITHUB_CLIENT_SECRET', 'AUTH_SECRET']);
   await expectStartupRefusal('AUTH_MODE=off on a non-loopback bind refuses to start', { HOST: '0.0.0.0', AUTH_MODE: 'off' },
     ['ALLOW_INSECURE_NO_AUTH']);
   await expectStartupRefusal('AUTH_MODE=oauth on loopback names the missing variable', {
-    AUTH_MODE: 'oauth', PUBLIC_BASE_URL: 'http://127.0.0.1:1', GITHUB_CLIENT_ID: 'x', GITHUB_CLIENT_SECRET: 'y',
+    AUTH_MODE: 'oauth', PUBLIC_BASE_URL: 'http://127.0.0.1:1', GITHUB_CLIENT_ID: 'x',
     AUTH_SECRET, EXCALIDRAW_DATA_DIR: join(scratch, 'unused')
   }, ['ALLOWED_GITHUB_LOGINS']);
   await expectStartupRefusal('unknown AUTH_MODE refuses to start', { AUTH_MODE: 'maybe' }, ['AUTH_MODE']);
@@ -411,8 +517,11 @@ async function checkRealServerFlow(github) {
   const port = await freePort();
   const base = `http://127.0.0.1:${port}`;
   const dataDir = join(scratch, `data-${port}`);
-  const canvas = spawnCanvas(port, authEnv(port, github.url, dataDir));
+  // debug level: anything the server logs lands in the log file, which is
+  // then searched for GitHub tokens.
+  const canvas = spawnCanvas(port, authEnv(port, github.url, dataDir, { LOG_LEVEL: 'debug' }));
   const issued = [];
+  let finished = false;
   try {
     await waitForHealth(base, canvas);
 
@@ -459,25 +568,53 @@ async function checkRealServerFlow(github) {
     assertEqual(first.headers.location, `/oauth/login?return_to=${encodeURIComponent(authorizePath)}`, 'redirect to login keeps the request');
 
     // Disallowed GitHub account gets no session.
-    const mallory = await githubLogin(base, github.url, 'mallory', authorizePath);
-    assertEqual(mallory.callback.status, 403, 'disallowed GitHub login');
+    const mallory = await githubLogin(base, github, 'mallory', authorizePath, '203.0.113.1');
+    assertEqual(mallory.poll.status, 200, `disallowed poll answers (${mallory.poll.text})`);
+    assertEqual(mallory.poll.body?.status, 'failed', 'disallowed GitHub login fails');
+    assertEqual(mallory.poll.body?.reason, 'not_allowed', 'disallowed GitHub login reason');
     assert(!sessionCookieName(mallory.jar), 'disallowed login sets no session cookie');
-    // Forged/missing state gets no session.
-    const forged = await request(base, { path: '/oauth/github/callback?code=code-FullFran&state=forged' });
-    assertEqual(forged.status, 400, 'callback without the state cookie');
-    assert(!sessionCookieName(setCookies(forged)), 'forged callback sets no session cookie');
-    ok('disallowed GitHub login and forged state get no session');
+    const malloryPage = await request(base, { path: '/oauth/device', headers: { cookie: cookieHeader(mallory.flow.jar) } });
+    assertEqual(malloryPage.status, 403, 'disallowed login ends on a 403 page');
+    assert(malloryPage.text.includes('not allowed') && malloryPage.text.includes('mallory'), 'the page names the refused account');
+    // A forged binding cookie gets nothing.
+    const forged = await request(base, { method: 'POST', path: '/oauth/device/poll', headers: { origin: base, cookie: 'wb_device=forged.value' } });
+    assertEqual(forged.status, 400, 'poll with a forged device cookie');
+    assert(!sessionCookieName(setCookies(forged)), 'forged poll sets no session cookie');
+    ok('disallowed GitHub login and forged device cookie get no session');
 
-    const login = await githubLogin(base, github.url, ALLOWED_LOGIN, authorizePath);
-    assertEqual(login.callback.status, 302, 'allowed login redirects back');
-    assertEqual(login.callback.headers.location, authorizePath, 'login returns to the authorize request');
+    const login = await githubLogin(base, github, ALLOWED_LOGIN, authorizePath, '203.0.113.2');
+    assertEqual(login.poll.status, 200, `allowed login poll (${login.poll.text})`);
+    assertEqual(login.poll.body?.status, 'complete', 'allowed login completes');
+    assertEqual(login.poll.body?.redirect, authorizePath, 'login returns to the authorize request');
     const sessionName = sessionCookieName(login.jar);
     assert(sessionName, 'allowed login sets a session cookie');
     const attributes = login.jar[sessionName].attributes;
     for (const attribute of ['HttpOnly', 'SameSite=Lax', 'Path=/']) assert(attributes.includes(attribute), `session cookie has ${attribute}`);
     assert(attributes.some(a => a.startsWith('Max-Age=')), 'session cookie expires');
     const jar = { [sessionName]: login.jar[sessionName] };
-    ok('allowed GitHub login (case-insensitive) gets an HttpOnly SameSite=Lax expiring session');
+    // Device page: the code, where to enter it, which app GitHub will name, the warning.
+    const devicePage = login.flow.devicePage;
+    assert(devicePage.text.includes(`${github.url}/login/device`), 'device page links GitHub\'s verification URI');
+    assert(devicePage.text.includes(GH_APP_NAME), 'device page names the GitHub app');
+    assert(devicePage.text.includes(DEVICE_WARNING), 'device page shows the phishing warning');
+    assert(/<script src="\/oauth\/device\.js"/.test(devicePage.text), 'device page polls with a same-origin script');
+    assert(/script-src 'self'/.test(devicePage.headers['content-security-policy'] ?? ''), 'device page CSP allows only our own script');
+    assertEqual(devicePage.headers['x-frame-options'], 'DENY', 'device page cannot be framed');
+    const deviceCookieName = Object.keys(login.flow.jar).find(name => name.endsWith('wb_device'));
+    assert(deviceCookieName, 'start sets the device-binding cookie');
+    const deviceAttributes = login.flow.jar[deviceCookieName].attributes;
+    for (const attribute of ['HttpOnly', 'SameSite=Strict', 'Path=/']) assert(deviceAttributes.includes(attribute), `device cookie has ${attribute}`);
+    const deviceMaxAge = Number(deviceAttributes.find(a => a.startsWith('Max-Age='))?.slice(8));
+    assert(deviceMaxAge > 0 && deviceMaxAge <= 900, `device cookie lives at most 15 min (got ${deviceMaxAge})`);
+    assert(login.jar[deviceCookieName]?.value === '', 'completion clears the device cookie');
+    const afterDone = await pollDevice(base, login.flow);
+    assertEqual(afterDone.status, 400, 'a completed device login cannot be polled again');
+    assert(!sessionCookieName(setCookies(afterDone)), 'a second poll of a completed login sets no session');
+    assert(!github.stats.clientSecretSeen, 'no client secret is ever sent to GitHub');
+    assert(!existsSync(join(dataDir, 'auth-secret')), 'an explicit AUTH_SECRET wins over the generated one');
+    ok('device flow: login page -> code + app name + warning -> GitHub approval -> session; authorize request preserved');
+
+    await checkDeviceEdgeCases(base, github);
 
     // --- consent ---
     const consentPage = await request(base, { path: authorizePath, headers: { cookie: cookieHeader(jar) } });
@@ -493,14 +630,22 @@ async function checkRealServerFlow(github) {
     const deniedUrl = new URL(denied.headers.location);
     assertEqual(deniedUrl.searchParams.get('error'), 'access_denied', 'deny returns access_denied');
     assertEqual(deniedUrl.searchParams.get('iss'), base, 'deny carries iss');
-    const approved = await consent(base, jar, consentPage);
+    // Tickets are single use: the denied one cannot be approved afterwards.
+    const afterDeny = await consent(base, jar, consentPage);
+    assertEqual(afterDeny.status, 400, 'a used consent ticket (denied) cannot be approved');
+    assert(!afterDeny.headers.location, 'a used consent ticket issues no redirect');
+    const consentPage2 = await request(base, { path: authorizePath, headers: { cookie: cookieHeader(jar) } });
+    const approved = await consent(base, jar, consentPage2);
     assertEqual(approved.status, 303, 'approve redirects');
+    const replayedTicket = await consent(base, jar, consentPage2);
+    assertEqual(replayedTicket.status, 400, 'an approved consent ticket cannot be posted again');
+    assert(!replayedTicket.headers.location, 'a replayed consent ticket issues no code');
     const approvedUrl = new URL(approved.headers.location);
     assertEqual(`${approvedUrl.origin}${approvedUrl.pathname}`, redirectUri, 'code goes to the registered redirect');
     assertEqual(approvedUrl.searchParams.get('state'), 'xyz', 'state echoed');
     assertEqual(approvedUrl.searchParams.get('iss'), base, 'RFC 9207 iss in the redirect');
     const code = approvedUrl.searchParams.get('code');
-    ok('consent page (client, id, redirect host); cross-origin consent rejected; iss + state in redirects');
+    ok('consent page (client, id, redirect host); cross-origin consent rejected; single-use tickets; iss + state in redirects');
 
     // --- token exchange ---
     const exchange = await tokenRequest(base, {
@@ -616,7 +761,13 @@ async function checkRealServerFlow(github) {
     assertEqual((await request(base, { method: 'POST', path: '/api/elements', json: element, headers: cookie })).status, 403, 'cookie POST without Origin');
     assertEqual((await request(base, { method: 'POST', path: '/api/elements', json: element, headers: { ...cookie, origin: base } })).status, 200, 'cookie POST from our origin');
     assertEqual((await request(base, { method: 'POST', path: '/api/elements', json: element, headers: bearer })).status, 200, 'bearer POST without Origin');
-    ok('canvas page and static assets need a session; /api accepts cookie or bearer; cookie writes need our Origin');
+    // Express routes case-insensitively: /API/... must get the same rules.
+    assertEqual((await request(base, { path: '/API/elements' })).status, 401, 'GET /API/elements without credentials');
+    assertEqual((await request(base, { method: 'POST', path: '/API/elements', json: element, headers: { ...cookie, origin: 'https://evil.example' } })).status, 403, 'cookie POST /API/elements from another origin');
+    assertEqual((await request(base, { method: 'POST', path: '/Api/elements', json: element, headers: cookie })).status, 403, 'cookie POST /Api/elements without Origin');
+    assertEqual((await request(base, { method: 'DELETE', path: '/API/elements/clear', headers: { ...cookie, origin: 'https://evil.example' } })).status, 403, 'cookie DELETE /API/elements/clear from another origin');
+    assertEqual((await request(base, { method: 'POST', path: '/Elsewhere', json: element, headers: { ...cookie, origin: 'https://evil.example' } })).status, 403, 'any cookie write from another origin');
+    ok('canvas page and static assets need a session; /api (any case) accepts cookie or bearer; cookie writes need our Origin');
 
     // MCP tool calls still reach the gated REST API in-process.
     const call = await request(base, {
@@ -665,17 +816,193 @@ async function checkRealServerFlow(github) {
     assertEqual(statSync(storePath).mode & 0o777, 0o600, 'auth store file mode');
     ok('auth store holds only SHA-256 hashes, mode 0600');
 
+    // --- oversized bodies are a client error, not a server error ---
+    const oversized = await request(base, { method: 'POST', path: '/oauth/register', json: { client_name: 'x'.repeat(20000), redirect_uris: [redirectUri] } });
+    assertEqual(oversized.status, 413, 'oversized DCR body');
+
     // --- logout ---
     const logout = await request(base, { method: 'POST', path: '/oauth/logout', headers: { ...cookie, origin: base } });
     assertEqual(logout.status, 303, 'logout');
     assert(Object.values(setCookies(logout)).some(c => c.value === '' && c.attributes.includes('Max-Age=0')), 'logout clears the cookie');
     ok('logout clears the session cookie');
+
+    // --- pending device logins are capped (last: it blocks new logins) ---
+    let capped;
+    for (let i = 0; i < 25 && !capped; i += 1) {
+      const attempt = await startDeviceLogin(base, { ip: `192.0.2.${100 + i}` });
+      if (attempt.started.status === 503) capped = attempt.started;
+      else assertEqual(attempt.started.status, 303, `device login ${i} before the cap`);
+    }
+    assert(capped, 'concurrent pending device logins are capped');
+    ok('concurrent pending device logins are capped');
+    finished = true;
   } catch (error) {
     error.message += `\n--- canvas output ---\n${canvas.output()}`;
     throw error;
   } finally {
     await stop(canvas);
   }
+  if (!finished) return;
+
+  // After the process exited, its log file is complete.
+  const log = `${readFileSync(canvas.logFile, 'utf8')}\n${canvas.output()}`;
+  assert(!log.includes('Unhandled error'), `a 413 is not logged as an unhandled error: ${log.slice(-600)}`);
+  const stored = readFileSync(join(dataDir, 'auth-store.json'), 'utf8');
+  const seen = transcript.join('\n');
+  assert(github.secrets.accessTokens.length > 0 && github.secrets.deviceCodes.length > 0, 'the fake GitHub issued tokens');
+  for (const secret of [...github.secrets.accessTokens, ...github.secrets.deviceCodes]) {
+    assert(!stored.includes(secret), 'a GitHub token or device code is in the auth store');
+    assert(!log.includes(secret), 'a GitHub token or device code is in the server log');
+    assert(!seen.includes(secret), 'a GitHub token or device code reached a client');
+  }
+  ok('GitHub access tokens and device codes never reach the store, the log (debug level) or any response; 413 not logged as unhandled');
+}
+
+async function checkDeviceEdgeCases(base, github) {
+  // authorization_pending from GitHub, then success; the interval is respected.
+  {
+    const flow = await startDeviceLogin(base, { ip: '203.0.113.10' });
+    const early = await pollDevice(base, flow);
+    assertEqual(early.body?.status, 'pending', 'poll before the interval');
+    assertEqual(github.polls(flow.userCode), 0, 'the server does not poll GitHub before the interval');
+    await sleep(1100);
+    const pending = await pollDevice(base, flow);
+    assertEqual(pending.body?.status, 'pending', `authorization_pending (${pending.text})`);
+    assertEqual(github.polls(flow.userCode), 1, 'GitHub polled once');
+    const again = await pollDevice(base, flow);
+    assertEqual(again.body?.status, 'pending', 'immediate re-poll');
+    assertEqual(github.polls(flow.userCode), 1, 'an immediate re-poll does not reach GitHub');
+    github.approve(flow.userCode, ALLOWED_LOGIN);
+    await sleep(1100);
+    const done = await pollDevice(base, flow);
+    assertEqual(done.body?.status, 'complete', `pending then complete (${done.text})`);
+    assert(sessionCookieName(setCookies(done)), 'pending then complete sets a session');
+  }
+  ok('authorization_pending keeps waiting at GitHub\'s interval, then the login completes');
+
+  // slow_down increases the interval.
+  {
+    const flow = await startDeviceLogin(base, { ip: '203.0.113.11' });
+    github.slowDown(flow.userCode);
+    await sleep(1100);
+    const slowed = await pollDevice(base, flow);
+    assertEqual(slowed.body?.status, 'pending', `slow_down keeps the login pending (${slowed.text})`);
+    assert(slowed.body?.interval >= 6, `slow_down raises the interval (got ${slowed.body?.interval})`);
+    await sleep(1100);
+    await pollDevice(base, flow);
+    assertEqual(github.polls(flow.userCode), 1, 'after slow_down the server waits the longer interval');
+  }
+  ok('slow_down increases the polling interval');
+
+  // expired_token and access_denied end with a clear page and no session.
+  for (const [label, act, reason, text] of [
+    ['expired_token', github.expire, 'expired', 'expired'],
+    ['access_denied', github.deny, 'denied', 'cancelled']
+  ]) {
+    const flow = await startDeviceLogin(base, { ip: label === 'expired_token' ? '203.0.113.12' : '203.0.113.13' });
+    act(flow.userCode);
+    await sleep(1100);
+    const failed = await pollDevice(base, flow);
+    assertEqual(failed.body?.status, 'failed', `${label}: poll fails`);
+    assertEqual(failed.body?.reason, reason, `${label}: reason`);
+    assert(!sessionCookieName(setCookies(failed)), `${label}: no session`);
+    const page = await request(base, { path: '/oauth/device', headers: { cookie: cookieHeader(flow.jar) } });
+    assertEqual(page.status, 400, `${label}: final page status`);
+    assert(page.text.toLowerCase().includes(text), `${label}: final page says ${text}: ${page.text.slice(0, 300)}`);
+    assert(page.text.includes('/oauth/login'), `${label}: final page offers to start again`);
+  }
+  ok('expired_token and access_denied end on a clear page without a session');
+
+  // A second browser cannot poll or complete someone else's device login.
+  {
+    const victim = await startDeviceLogin(base, { ip: '203.0.113.14' });
+    const other = await startDeviceLogin(base, { ip: '203.0.113.15' });
+    github.approve(victim.userCode, ALLOWED_LOGIN);
+    await sleep(1100);
+    const otherPoll = await pollDevice(base, other);
+    assertEqual(otherPoll.body?.status, 'pending', 'the other browser only sees its own login');
+    assert(!sessionCookieName(setCookies(otherPoll)), 'the other browser gets no session');
+    const noCookie = await pollDevice(base, victim, { jar: null });
+    assertEqual(noCookie.status, 400, 'poll without the device cookie');
+    assert(!sessionCookieName(setCookies(noCookie)), 'no session without the device cookie');
+    const noCookiePage = await request(base, { path: '/oauth/device' });
+    assertEqual(noCookiePage.status, 400, 'device page without the device cookie');
+    assert(!noCookiePage.text.includes(victim.userCode), 'another browser never sees the user code');
+    const name = Object.keys(victim.jar).find(n => n.endsWith('wb_device'));
+    const tampered = { [name]: { value: `${victim.jar[name].value.slice(0, -2)}xx`, attributes: [] } };
+    assertEqual((await pollDevice(base, victim, { jar: tampered })).status, 400, 'poll with a tampered device cookie');
+    const crossSite = await pollDevice(base, victim, { origin: 'https://evil.example' });
+    assertEqual(crossSite.status, 403, 'poll from another origin');
+    const crossSiteNoOrigin = await pollDevice(base, victim, { origin: null });
+    assertEqual(crossSiteNoOrigin.status, 403, 'poll without Origin');
+    const mine = await pollDevice(base, victim);
+    assertEqual(mine.body?.status, 'complete', `the browser that started the login completes it (${mine.text})`);
+  }
+  ok('a second browser (or no/tampered cookie, or another origin) cannot poll or complete a device login');
+
+  // Code requests are rate limited per IP.
+  {
+    const statuses = [];
+    for (let i = 0; i < 6; i += 1) statuses.push((await startDeviceLogin(base, { ip: '203.0.113.20' })).started.status);
+    assertEqual(statuses.slice(0, 5).join(','), '303,303,303,303,303', 'first five code requests from one IP');
+    assertEqual(statuses[5], 429, 'sixth code request within a minute from one IP');
+    const otherIp = await startDeviceLogin(base, { ip: '203.0.113.21' });
+    assertEqual(otherIp.started.status, 303, 'another IP is not affected');
+    const crossSite = await request(base, { method: 'POST', path: '/oauth/login', headers: { origin: 'https://evil.example', ...ipHeaders('203.0.113.22') }, form: { return_to: '/' } });
+    assertEqual(crossSite.status, 403, 'device login start from another origin');
+  }
+  ok('device code requests rate limited per IP (5/min) and same-origin only');
+}
+
+async function checkGeneratedSecret(github) {
+  const port = await freePort();
+  const base = `http://127.0.0.1:${port}`;
+  const dataDir = join(scratch, `generated-${port}`);
+  const env = authEnv(port, github.url, dataDir, { LOG_LEVEL: 'warn', GITHUB_CLIENT_SECRET: GH_CLIENT_SECRET });
+  delete env.AUTH_SECRET;
+  const secretPath = join(dataDir, 'auth-secret');
+  let canvas = spawnCanvas(port, env);
+  let jar;
+  let secret;
+  try {
+    await waitForHealth(base, canvas);
+    const mode = statSync(secretPath).mode & 0o777;
+    assertEqual(mode, 0o600, 'generated secret file mode');
+    secret = readFileSync(secretPath, 'utf8').trim();
+    assert(secret.length >= 32, `generated secret is long enough (${secret.length})`);
+    const deadline = Date.now() + 2000;
+    while (!canvas.output().includes('GITHUB_CLIENT_SECRET') && Date.now() < deadline) await sleep(50);
+    assert(/GITHUB_CLIENT_SECRET.*no longer used/.test(canvas.output()), `leftover GITHUB_CLIENT_SECRET only warns: ${canvas.output()}`);
+    const login = await githubLogin(base, github, ALLOWED_LOGIN, '/', '198.51.100.1');
+    assertEqual(login.poll.body?.status, 'complete', `login with the generated secret (${login.poll.text})`);
+    const name = sessionCookieName(login.jar);
+    jar = { [name]: login.jar[name] };
+    assertEqual((await request(base, { path: '/api/elements', headers: { cookie: cookieHeader(jar) } })).status, 200, 'session works');
+  } catch (error) {
+    error.message += `\n--- canvas output ---\n${canvas.output()}`;
+    throw error;
+  } finally {
+    await stop(canvas);
+  }
+  canvas = spawnCanvas(port, env);
+  try {
+    await waitForHealth(base, canvas);
+    assertEqual(readFileSync(secretPath, 'utf8').trim(), secret, 'the secret is reused on restart');
+    assertEqual((await request(base, { path: '/api/elements', headers: { cookie: cookieHeader(jar) } })).status, 200, 'the session survives a restart');
+  } catch (error) {
+    error.message += `\n--- canvas output ---\n${canvas.output()}`;
+    throw error;
+  } finally {
+    await stop(canvas);
+  }
+  ok('no GitHub client secret needed (a leftover one only warns); signing secret generated 0600 and reused, sessions survive a restart');
+
+  chmodSync(secretPath, 0o644);
+  await expectStartupRefusal('a group/world-readable auth-secret file refuses to start', env, ['auth-secret', '0600']);
+  const shortDir = join(scratch, `short-${port}`);
+  mkdirSync(shortDir, { recursive: true, mode: 0o700 });
+  writeFileSync(join(shortDir, 'auth-secret'), 'short\n', { mode: 0o600 });
+  await expectStartupRefusal('a too short auth-secret file refuses to start', { ...env, EXCALIDRAW_DATA_DIR: shortDir }, ['auth-secret', '32']);
 }
 
 // ---------------------------------------------------------------------------
@@ -742,11 +1069,17 @@ async function checkInProcess(github) {
   const insecure = resolveAuthConfig('0.0.0.0', { AUTH_MODE: 'off', ALLOW_INSECURE_NO_AUTH: 'true' });
   assert(insecure.mode === 'off' && insecure.insecure === true, 'ALLOW_INSECURE_NO_AUTH=true allows auth off on a public bind');
   const fullEnv = {
-    PUBLIC_BASE_URL: 'https://board.example.com', GITHUB_CLIENT_ID: 'id', GITHUB_CLIENT_SECRET: 'secret',
+    PUBLIC_BASE_URL: 'https://board.example.com', GITHUB_CLIENT_ID: 'id',
     ALLOWED_GITHUB_LOGINS: 'FullFran', AUTH_SECRET, EXCALIDRAW_DATA_DIR: join(scratch, 'cfg')
   };
   const onConfig = resolveAuthConfig('0.0.0.0', fullEnv);
   assert(onConfig.mode === 'oauth' && onConfig.resource === 'https://board.example.com/mcp' && onConfig.secureCookies, 'public bind with full config');
+  assertEqual(onConfig.warnings.length, 0, 'no warnings without a leftover client secret');
+  assert(!('clientSecret' in onConfig.github), 'no GitHub client secret in the config');
+  for (const leftover of [{ GITHUB_CLIENT_SECRET: 'old' }, { GITHUB_CLIENT_SECRET_FILE: '/nonexistent/secret' }]) {
+    const warned = resolveAuthConfig('0.0.0.0', { ...fullEnv, ...leftover });
+    assert(warned.warnings.some(w => w.includes(Object.keys(leftover)[0]) && w.includes('no longer used')), `${Object.keys(leftover)[0]} only warns`);
+  }
   const throwsWith = (env, text, label) => {
     try {
       resolveAuthConfig('0.0.0.0', env);
@@ -760,12 +1093,13 @@ async function checkInProcess(github) {
   throwsWith({ ...fullEnv, PUBLIC_BASE_URL: 'https://board.example.com/sub' }, 'without a path', 'base URL with a path');
   throwsWith({ ...fullEnv, AUTH_SECRET: 'short' }, 'AUTH_SECRET', 'short secret');
   throwsWith({ ...fullEnv, ALLOWED_GITHUB_LOGINS: 'bad login!' }, 'invalid GitHub login', 'bad login');
-  ok('config: loopback default off, ALLOW_INSECURE_NO_AUTH, https/origin-only base URL, secret length, login syntax');
+  ok('config: loopback default off, ALLOW_INSECURE_NO_AUTH, https/origin-only base URL, secret length, login syntax, leftover client secret warns');
 
   // --- SSRF guard (the strict default, as the server uses it) ---
   const { publicAddressGuard, safeFetch } = ssrf;
   for (const address of ['127.0.0.1', '10.1.2.3', '172.16.0.1', '192.168.1.1', '169.254.169.254', '100.64.0.1', '0.0.0.0',
-    '::1', '::', 'fd00::1', 'fe80::1', '::ffff:127.0.0.1', '::ffff:10.0.0.1', '224.0.0.1']) {
+    '::1', '::', 'fd00::1', 'fe80::1', '::ffff:127.0.0.1', '::ffff:10.0.0.1', '224.0.0.1',
+    '::127.0.0.1', '::10.0.0.1', '::7f00:1', '::8.8.8.8']) {
     assert(!publicAddressGuard(address), `guard blocks ${address}`);
   }
   for (const address of ['8.8.8.8', '1.1.1.1', '2606:4700:4700::1111']) assert(publicAddressGuard(address), `guard allows ${address}`);
@@ -791,7 +1125,7 @@ async function checkInProcess(github) {
   let strictRejected = false;
   try { await strictResolver.resolve(`${cimdBase}/client.json`); } catch (error) { strictRejected = error.code === 'invalid_client'; }
   assert(strictRejected, 'default CIMD resolver refuses a loopback metadata URL');
-  ok('SSRF guard: private/loopback/link-local/mapped addresses blocked, https only, loopback CIMD URL refused in non-test mode');
+  ok('SSRF guard: private/loopback/link-local/mapped/IPv4-compatible addresses blocked, https only, loopback CIMD URL refused in non-test mode');
 
   // --- CIMD flow on an in-process authorization server ---
   const loopbackOnly = address => address === '127.0.0.1' || address === '::1';
@@ -809,7 +1143,8 @@ async function checkInProcess(github) {
     issuer: `http://127.0.0.1:${issuerPort}`,
     resource: `http://127.0.0.1:${issuerPort}/mcp`,
     secureCookies: false,
-    github: { clientId: GH_CLIENT_ID, clientSecret: GH_CLIENT_SECRET, oauthBaseUrl: github.url, apiBaseUrl: github.url },
+    github: { clientId: GH_CLIENT_ID, oauthBaseUrl: github.url, apiBaseUrl: github.url, appName: GH_APP_NAME },
+    warnings: [],
     allowedLogins: new Set([ALLOWED_LOGIN.toLowerCase()]),
     secret: Buffer.from(AUTH_SECRET),
     storePath: join(storeDir, 'auth-store.json'),
@@ -833,7 +1168,8 @@ async function checkInProcess(github) {
   await new Promise((resolve, reject) => { server.once('error', reject); server.listen(realPort, '127.0.0.1', resolve); });
   const base = `http://127.0.0.1:${realPort}`;
   try {
-    const login = await githubLogin(base, github.url, ALLOWED_LOGIN);
+    const login = await githubLogin(base, github, ALLOWED_LOGIN);
+    assertEqual(login.poll.body?.status, 'complete', `in-process device login (${login.poll.text})`);
     const name = sessionCookieName(login.jar);
     const jar = { [name]: login.jar[name] };
 
@@ -914,11 +1250,15 @@ try {
   await checkDefaultLoopbackStaysOpen();
   await checkStartupRules();
   await checkRealServerFlow(github);
+  await checkGeneratedSecret(github);
   await checkInProcess(github);
   console.log(`Auth check passed: ${passed} groups using ${runtimeName}.`);
 } catch (error) {
   console.error(`Auth check failed after ${passed} passing groups: ${error.stack || error.message}`);
+  console.error(`scratch kept: ${scratch}`);
   process.exitCode = 1;
 } finally {
+  killAll();
   await github.close();
 }
+if (process.exitCode !== 1) rmSync(scratch, { recursive: true, force: true });

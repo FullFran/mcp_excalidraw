@@ -22,11 +22,16 @@ const STYLE = `
   .actions { display: flex; gap: 12px; margin-top: 20px; }
   button { font: inherit; padding: 8px 16px; border-radius: 8px; border: 1px solid var(--border); background: transparent; color: var(--fg); cursor: pointer; }
   button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .user-code { display: block; font: 600 2rem/1.2 ui-monospace, monospace; letter-spacing: .12em; text-align: center; margin: 16px 0; padding: 12px; border: 1px dashed var(--border); border-radius: 8px; }
+  .warning { border-left: 4px solid #d93025; padding: 8px 12px; background: color-mix(in srgb, #d93025 10%, transparent); border-radius: 4px; }
+  a { color: var(--accent); }
 `;
 
+const BASE_CSP = "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'";
+
 /** Headers for every HTML page the auth server renders. */
-function securityHeaders(res: Response): void {
-  res.setHeader('Content-Security-Policy', "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'");
+function securityHeaders(res: Response, extraCsp = ''): void {
+  res.setHeader('Content-Security-Policy', `${BASE_CSP}${extraCsp}`);
   res.setHeader('X-Frame-Options', 'DENY');
   // Not no-referrer: that makes browsers send `Origin: null` on the consent
   // form POST, which the CSRF check would then reject.
@@ -40,9 +45,87 @@ function page(title: string, body: string): string {
     `<title>${escapeHtml(title)}</title><style>${STYLE}</style></head><body><main><div class="card">${body}</div></main></body></html>`;
 }
 
-export function sendErrorPage(res: Response, status: number, title: string, message: string): void {
+export function sendErrorPage(res: Response, status: number, title: string, message: string, retryPath?: string): void {
   securityHeaders(res);
-  res.status(status).type('html').send(page(title, `<h1>${escapeHtml(title)}</h1><p>${escapeHtml(message)}</p>`));
+  const retry = retryPath ? `<p><a href="${escapeHtml(retryPath)}">Start the sign-in again</a></p>` : '';
+  res.status(status).type('html').send(page(title, `<h1>${escapeHtml(title)}</h1><p>${escapeHtml(message)}</p>${retry}`));
+}
+
+/** First step: a same-origin POST starts the GitHub device flow. */
+export function sendLoginPage(res: Response, returnTo: string): void {
+  securityHeaders(res);
+  const body = `
+    <h1>Sign in to the whiteboard</h1>
+    <p>Sign in with your GitHub account. You will get a short code to enter on GitHub.</p>
+    <form method="post" action="/oauth/login">
+      <input type="hidden" name="return_to" value="${escapeHtml(returnTo)}">
+      <div class="actions"><button class="primary" type="submit">Sign in with GitHub</button></div>
+    </form>`;
+  res.status(200).type('html').send(page('Sign in', body));
+}
+
+export interface DeviceView {
+  userCode: string;
+  verificationUri: string;
+  appName?: string;
+  intervalSeconds: number;
+  expiresAt: number;
+}
+
+/**
+ * Second step: the code to enter on GitHub. The page polls this server with
+ * a same-origin script (no secrets in it: the binding cookie is HttpOnly).
+ */
+export function sendDevicePage(res: Response, view: DeviceView): void {
+  securityHeaders(res, "; script-src 'self'; connect-src 'self'");
+  const app = view.appName
+    ? `GitHub will ask you to authorize <strong>${escapeHtml(view.appName)}</strong>. If it names another app, stop.`
+    : 'GitHub will ask you to authorize the OAuth app created for this whiteboard. If it names an app you do not recognise, stop.';
+  const minutes = Math.max(1, Math.round((view.expiresAt - Date.now()) / 60000));
+  const body = `
+    <h1>Enter this code on GitHub</h1>
+    <p class="warning"><strong>Only enter this code if you started this sign-in on this screen just now.</strong> Nobody from this whiteboard will ever send you a code to enter.</p>
+    <code class="user-code">${escapeHtml(view.userCode)}</code>
+    <p>Open <a href="${escapeHtml(view.verificationUri)}" target="_blank" rel="noopener noreferrer">${escapeHtml(view.verificationUri)}</a> and type the code. ${app}</p>
+    <p class="note" id="device-status" data-interval="${view.intervalSeconds}">Waiting for GitHub… This code expires in about ${minutes} minute${minutes === 1 ? '' : 's'}. Keep this page open; it continues by itself.</p>
+    <form method="post" action="/oauth/device/poll">
+      <div class="actions"><button type="submit">I have entered the code</button></div>
+    </form>
+    <script src="/oauth/device.js" defer></script>`;
+  res.status(200).type('html').send(page('Enter the code on GitHub', body));
+}
+
+/** Polls `/oauth/device/poll` at the server-given interval, then moves on. */
+export const DEVICE_SCRIPT = `(() => {
+  const status = document.getElementById('device-status');
+  let interval = Math.max(1, Number(status && status.dataset.interval) || 5);
+  const poll = async () => {
+    let result;
+    try {
+      const response = await fetch('/oauth/device/poll', { method: 'POST', credentials: 'same-origin', headers: { accept: 'application/json' } });
+      result = await response.json();
+    } catch {
+      result = { status: 'pending' };
+    }
+    if (result && result.status === 'complete' && typeof result.redirect === 'string' && result.redirect.startsWith('/') && !result.redirect.startsWith('//')) {
+      window.location.assign(result.redirect);
+      return;
+    }
+    if (!result || result.status !== 'pending') {
+      window.location.assign('/oauth/device');
+      return;
+    }
+    if (typeof result.interval === 'number' && result.interval > 0) interval = result.interval;
+    setTimeout(poll, interval * 1000);
+  };
+  setTimeout(poll, interval * 1000);
+})();
+`;
+
+export function sendDeviceScript(res: Response): void {
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.status(200).type('application/javascript').send(DEVICE_SCRIPT);
 }
 
 export interface ConsentView {

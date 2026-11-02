@@ -1,4 +1,5 @@
-import { readFileSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
+import { closeSync, fsyncSync, linkSync, lstatSync, mkdirSync, openSync, readFileSync, unlinkSync, writeSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { resolvePublicBaseUrl } from '../core/config.js';
 import { isLoopbackBindHost } from '../core/mcp-http.js';
@@ -8,6 +9,8 @@ export const WHITEBOARD_SCOPE = 'whiteboard';
 
 /** Smallest accepted signing secret (characters of the env/file value). */
 const MIN_SECRET_LENGTH = 32;
+/** File in the data directory holding the generated signing secret. */
+export const GENERATED_SECRET_FILENAME = 'auth-secret';
 const GITHUB_LOGIN_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,38})$/i;
 const LOOPBACK_URL_HOSTS = new Set(['127.0.0.1', 'localhost', '[::1]']);
 
@@ -33,11 +36,15 @@ export interface AuthOnConfig {
   /** Whether cookies get `Secure` (the public base URL is https). */
   secureCookies: boolean;
   github: {
+    /** Public client ID of the GitHub OAuth app (device flow: no client secret). */
     clientId: string;
-    clientSecret: string;
+    /** Name of the GitHub OAuth app, shown on the login page as a hint. */
+    appName?: string;
     oauthBaseUrl: string;
     apiBaseUrl: string;
   };
+  /** Non-fatal configuration notes to log at startup. */
+  warnings: string[];
   /** Lower-cased GitHub logins allowed to get a session. */
   allowedLogins: Set<string>;
   /** Raw signing secret; keys are derived from it per purpose. */
@@ -54,7 +61,7 @@ export type AuthConfig = AuthOffConfig | AuthOnConfig;
 
 type Env = Record<string, string | undefined>;
 
-function readSecret(env: Env, name: string, missing: string[]): string | undefined {
+function readSecret(env: Env, name: string): string | undefined {
   const direct = env[name]?.trim();
   const filePath = env[`${name}_FILE`]?.trim();
   if (direct && filePath) {
@@ -70,8 +77,64 @@ function readSecret(env: Env, name: string, missing: string[]): string | undefin
     }
     throw new AuthConfigError(`${name}_FILE (${filePath}) is empty.`);
   }
-  missing.push(`${name} (or ${name}_FILE)`);
   return undefined;
+}
+
+/**
+ * Reads the signing secret kept in the data directory, creating it on first
+ * start: 48 random bytes, base64, written to a temporary file with mode 0600
+ * and hard-linked into place, so a concurrent start never sees a partial file
+ * and never overwrites an existing one. An existing file must be private to
+ * its owner and long enough, or startup is refused.
+ */
+function loadOrCreateGeneratedSecret(dataDir: string): string {
+  const path = join(dataDir, GENERATED_SECRET_FILENAME);
+  const readExisting = (): string => {
+    const stat = lstatSync(path);
+    if (!stat.isFile()) throw new AuthConfigError(`${path} must be a regular file.`);
+    if ((stat.mode & 0o077) !== 0) {
+      throw new AuthConfigError(
+        `${path} is readable by group or others (mode ${(stat.mode & 0o777).toString(8).padStart(4, '0')}); ` +
+        `it holds the session-signing secret and must be 0600. Run \`chmod 600 ${path}\` or delete it to generate a new one (this signs everyone out).`
+      );
+    }
+    const value = readFileSync(path, 'utf8').trim();
+    if (value.length < MIN_SECRET_LENGTH) {
+      throw new AuthConfigError(`${path} must hold at least ${MIN_SECRET_LENGTH} characters; delete it to generate a new secret.`);
+    }
+    return value;
+  };
+  try {
+    return readExisting();
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+      if (error instanceof AuthConfigError) throw error;
+      throw new AuthConfigError(`Cannot read ${path}: ${(error as Error).message}`);
+    }
+  }
+  try {
+    mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+    const value = randomBytes(48).toString('base64');
+    const temporary = `${path}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`;
+    const fd = openSync(temporary, 'wx', 0o600);
+    try {
+      writeSync(fd, `${value}\n`);
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+    try {
+      linkSync(temporary, path);
+    } catch (error) {
+      // Another process created it first: use that one.
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+    } finally {
+      unlinkSync(temporary);
+    }
+  } catch (error) {
+    throw new AuthConfigError(`Cannot create the signing secret ${path}: ${(error as Error).message}`);
+  }
+  return readExisting();
 }
 
 function readTtl(env: Env, name: string, fallback: number, min: number, max: number): number {
@@ -139,8 +202,14 @@ export function resolveAuthConfig(bindHost: string, env: Env = process.env): Aut
 
   const clientId = env.GITHUB_CLIENT_ID?.trim();
   if (!clientId) missing.push('GITHUB_CLIENT_ID');
-  const clientSecret = readSecret(env, 'GITHUB_CLIENT_SECRET', missing);
-  const secret = readSecret(env, 'AUTH_SECRET', missing);
+  const warnings: string[] = [];
+  for (const name of ['GITHUB_CLIENT_SECRET', 'GITHUB_CLIENT_SECRET_FILE']) {
+    if (env[name]?.trim()) {
+      warnings.push(`${name} is set but no longer used: GitHub login uses the device flow with the public client ID only. Remove it.`);
+    }
+  }
+  // Explicit secret first; otherwise one is generated in the data directory.
+  const explicitSecret = readSecret(env, 'AUTH_SECRET');
 
   const loginsRaw = env.ALLOWED_GITHUB_LOGINS?.trim();
   if (!loginsRaw) missing.push('ALLOWED_GITHUB_LOGINS');
@@ -166,7 +235,7 @@ export function resolveAuthConfig(bindHost: string, env: Env = process.env): Aut
       `PUBLIC_BASE_URL must use https when authentication is on (http is only accepted for loopback hosts), got ${JSON.stringify(issuer)}.`
     );
   }
-  if (secret!.length < MIN_SECRET_LENGTH) {
+  if (explicitSecret !== undefined && explicitSecret.length < MIN_SECRET_LENGTH) {
     throw new AuthConfigError(`AUTH_SECRET must be at least ${MIN_SECRET_LENGTH} characters (use e.g. \`openssl rand -base64 48\`).`);
   }
 
@@ -183,6 +252,17 @@ export function resolveAuthConfig(bindHost: string, env: Env = process.env): Aut
     throw new AuthConfigError('ALLOWED_GITHUB_LOGINS must list at least one GitHub login.');
   }
 
+  const appName = env.GITHUB_APP_NAME?.trim();
+  if (appName !== undefined && appName.length > 100) throw new AuthConfigError('GITHUB_APP_NAME must be at most 100 characters.');
+  const oauthBaseUrl = normalizeBaseUrl('GITHUB_OAUTH_BASE_URL', env.GITHUB_OAUTH_BASE_URL?.trim() || 'https://github.com');
+  const apiBaseUrl = normalizeBaseUrl('GITHUB_API_BASE_URL', env.GITHUB_API_BASE_URL?.trim() || 'https://api.github.com');
+  const accessTokenTtlSeconds = readTtl(env, 'AUTH_ACCESS_TOKEN_TTL_SECONDS', 3600, 1, 86400);
+  const refreshTokenTtlSeconds = readTtl(env, 'AUTH_REFRESH_TOKEN_TTL_SECONDS', 30 * 86400, 60, 90 * 86400);
+  const sessionTtlSeconds = readTtl(env, 'AUTH_SESSION_TTL_SECONDS', 7 * 86400, 60, 30 * 86400);
+  // Last, after every other check, so a configuration error never leaves a
+  // new secret file behind.
+  const secret = explicitSecret ?? loadOrCreateGeneratedSecret(resolve(dataDir!));
+
   const base = url.origin;
   return {
     mode: 'oauth',
@@ -191,16 +271,17 @@ export function resolveAuthConfig(bindHost: string, env: Env = process.env): Aut
     secureCookies: url.protocol === 'https:',
     github: {
       clientId: clientId!,
-      clientSecret: clientSecret!,
-      oauthBaseUrl: normalizeBaseUrl('GITHUB_OAUTH_BASE_URL', env.GITHUB_OAUTH_BASE_URL?.trim() || 'https://github.com'),
-      apiBaseUrl: normalizeBaseUrl('GITHUB_API_BASE_URL', env.GITHUB_API_BASE_URL?.trim() || 'https://api.github.com')
+      ...(appName ? { appName } : {}),
+      oauthBaseUrl,
+      apiBaseUrl
     },
+    warnings,
     allowedLogins,
-    secret: Buffer.from(secret!, 'utf8'),
+    secret: Buffer.from(secret, 'utf8'),
     storePath: join(resolve(dataDir!), 'auth-store.json'),
-    accessTokenTtlSeconds: readTtl(env, 'AUTH_ACCESS_TOKEN_TTL_SECONDS', 3600, 1, 86400),
-    refreshTokenTtlSeconds: readTtl(env, 'AUTH_REFRESH_TOKEN_TTL_SECONDS', 30 * 86400, 60, 90 * 86400),
-    sessionTtlSeconds: readTtl(env, 'AUTH_SESSION_TTL_SECONDS', 7 * 86400, 60, 30 * 86400),
+    accessTokenTtlSeconds,
+    refreshTokenTtlSeconds,
+    sessionTtlSeconds,
     authorizationCodeTtlSeconds: 60
   };
 }

@@ -19,9 +19,9 @@ import {
 } from './clients.js';
 import type { ResolvedClient } from './clients.js';
 import type { SafeFetchOptions } from './ssrf.js';
-import { GitHubLoginError, exchangeGitHubCode, githubAuthorizeUrl } from './github.js';
+import { GitHubLoginError, pollDeviceLogin, requestDeviceCode } from './github.js';
 import { rateLimit } from './rate-limit.js';
-import { sendConsentPage, sendErrorPage } from './pages.js';
+import { sendConsentPage, sendDevicePage, sendDeviceScript, sendErrorPage, sendLoginPage } from './pages.js';
 
 export { resolveAuthConfig, AuthConfigError, WHITEBOARD_SCOPE } from './config.js';
 export type { AuthConfig, AuthOnConfig } from './config.js';
@@ -30,10 +30,13 @@ export type { AuthConfig, AuthOnConfig } from './config.js';
 export const INTERNAL_AUTH_HEADER = 'x-excalidraw-internal-auth';
 
 const SESSION_PURPOSE = 'session';
-const GITHUB_STATE_PURPOSE = 'github-state';
+const DEVICE_PURPOSE = 'device-login';
 const CONSENT_PURPOSE = 'consent';
-const GITHUB_STATE_TTL_SECONDS = 600;
 const CONSENT_TTL_SECONDS = 600;
+/** Device codes live as long as GitHub says, but never longer than this. */
+const MAX_DEVICE_LOGIN_SECONDS = 15 * 60;
+/** Device logins waiting for GitHub at once, across all clients. */
+const MAX_PENDING_DEVICE_LOGINS = 20;
 const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
 
 export interface AuthDeps {
@@ -56,6 +59,27 @@ interface CodeRecord {
   expiresAt: number;
   used: boolean;
   familyId?: string;
+}
+
+type DeviceOutcome =
+  | { kind: 'success'; login: string }
+  | { kind: 'not_allowed'; login: string }
+  | { kind: 'expired' }
+  | { kind: 'denied' }
+  | { kind: 'error' };
+
+/** A GitHub device login, reachable only through its browser's binding cookie. */
+interface DeviceLogin {
+  deviceCode: string;
+  userCode: string;
+  verificationUri: string;
+  /** Epoch milliseconds. */
+  expiresAt: number;
+  intervalMs: number;
+  nextPollAt: number;
+  returnTo: string;
+  outcome?: DeviceOutcome;
+  polling?: Promise<void>;
 }
 
 export type WebSocketVerdict = { ok: true } | { ok: false; status: 401 | 403; message: string };
@@ -122,21 +146,25 @@ export function createAuth(config: AuthOnConfig, deps: AuthDeps = {}): Auth {
   const signer = new Signer(config.secret);
   const cimd = new CimdResolver(deps.cimdFetch);
   const codes = new Map<string, CodeRecord>();
+  // nonce (from the browser's signed cookie) -> pending GitHub device login
+  const deviceLogins = new Map<string, DeviceLogin>();
+  // consent ticket id -> expiry (epoch seconds); tickets are single use
+  const usedTickets = new Map<string, number>();
   const internalToken = randomToken(32);
   const issuerOrigin = config.issuer;
   const cookiePrefix = config.secureCookies ? '__Host-' : '';
   const sessionCookie = `${cookiePrefix}wb_session`;
-  const stateCookie = `${cookiePrefix}wb_github_state`;
+  const deviceCookie = `${cookiePrefix}wb_device`;
   const resourceMetadataUrl = `${config.issuer}/.well-known/oauth-protected-resource`;
-  const githubCallbackUrl = `${config.issuer}/oauth/github/callback`;
 
-  const cookieAttributes = (maxAge: number): string =>
-    `Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAge}${config.secureCookies ? '; Secure' : ''}`;
-  const setCookie = (res: Response, name: string, value: string, maxAge: number): void => {
-    res.append('Set-Cookie', `${name}=${encodeURIComponent(value)}; ${cookieAttributes(maxAge)}`);
+  type SameSite = 'Lax' | 'Strict';
+  const cookieAttributes = (maxAge: number, sameSite: SameSite): string =>
+    `Path=/; HttpOnly; SameSite=${sameSite}; Max-Age=${maxAge}${config.secureCookies ? '; Secure' : ''}`;
+  const setCookie = (res: Response, name: string, value: string, maxAge: number, sameSite: SameSite = 'Lax'): void => {
+    res.append('Set-Cookie', `${name}=${encodeURIComponent(value)}; ${cookieAttributes(maxAge, sameSite)}`);
   };
-  const clearCookie = (res: Response, name: string): void => {
-    res.append('Set-Cookie', `${name}=; ${cookieAttributes(0)}`);
+  const clearCookie = (res: Response, name: string, sameSite: SameSite = 'Lax'): void => {
+    res.append('Set-Cookie', `${name}=; ${cookieAttributes(0, sameSite)}`);
   };
 
   const readSession = (cookieHeader: string | undefined): Session | null => {
@@ -216,6 +244,9 @@ export function createAuth(config: AuthOnConfig, deps: AuthDeps = {}): Auth {
   };
 
   const loginLimiter = rateLimit({ windowMs: 60_000, max: 20, name: 'login' });
+  // Each start asks GitHub for a device code.
+  const deviceStartLimiter = rateLimit({ windowMs: 60_000, max: 5, name: 'sign-in' });
+  const devicePollLimiter = rateLimit({ windowMs: 60_000, max: 60, name: 'sign-in status' });
   const tokenLimiter = rateLimit({ windowMs: 60_000, max: 60, name: 'token' });
   const registerLimiter = rateLimit({ windowMs: 60_000, max: 10, name: 'registration' });
   // Authorization requests can make the server fetch a client metadata document.
@@ -274,51 +305,213 @@ export function createAuth(config: AuthOnConfig, deps: AuthDeps = {}): Auth {
     }
   });
 
-  // ---- GitHub login ----
+  // ---- GitHub login (OAuth device flow) ----
+  //
+  // The browser that starts a device login gets a signed, HttpOnly,
+  // SameSite=Strict cookie holding a random nonce; the device code itself
+  // stays in this map. Only that browser can see the code, poll and complete
+  // the login, so a code shown on one screen cannot be completed elsewhere.
+
+  const pruneDeviceLogins = (): void => {
+    const now = Date.now();
+    for (const [nonce, record] of deviceLogins) if (record.expiresAt <= now) deviceLogins.delete(nonce);
+  };
+
+  const deviceRecord = (req: Request): { nonce: string; record: DeviceLogin } | null => {
+    pruneDeviceLogins();
+    const payload = signer.verify<{ n?: unknown }>(DEVICE_PURPOSE, parseCookies(req.headers.cookie).get(deviceCookie));
+    if (!payload || typeof payload.n !== 'string') return null;
+    const record = deviceLogins.get(payload.n);
+    return record ? { nonce: payload.n, record } : null;
+  };
+
+  /** Polls GitHub for this login when its interval allows; one poll at a time. */
+  const advanceDeviceLogin = async (record: DeviceLogin): Promise<void> => {
+    if (record.outcome) return;
+    if (record.polling) return record.polling;
+    const now = Date.now();
+    if (now >= record.expiresAt) {
+      record.outcome = { kind: 'expired' };
+      return;
+    }
+    if (now < record.nextPollAt) return;
+    record.polling = (async () => {
+      try {
+        const result = await pollDeviceLogin(config, record.deviceCode);
+        const after = Date.now();
+        switch (result.kind) {
+          case 'pending':
+            record.nextPollAt = after + record.intervalMs;
+            break;
+          case 'slow_down':
+            // RFC 8628 §3.5: add 5 s, or use GitHub's new interval if larger.
+            record.intervalMs = Math.max(record.intervalMs + 5000, (result.intervalSeconds ?? 0) * 1000);
+            record.nextPollAt = after + record.intervalMs;
+            break;
+          case 'expired':
+            record.outcome = { kind: 'expired' };
+            break;
+          case 'denied':
+            record.outcome = { kind: 'denied' };
+            break;
+          case 'error':
+            logger.warn('GitHub device login failed', { reason: result.code });
+            record.outcome = { kind: 'error' };
+            break;
+          case 'login':
+            if (config.allowedLogins.has(result.login.toLowerCase())) {
+              record.outcome = { kind: 'success', login: result.login };
+            } else {
+              logger.warn('GitHub login not in ALLOWED_GITHUB_LOGINS', { login: result.login });
+              record.outcome = { kind: 'not_allowed', login: result.login };
+            }
+            break;
+        }
+      } catch (error) {
+        if (!(error instanceof GitHubLoginError)) throw error;
+        // GitHub unreachable: keep the login pending and try again later.
+        logger.warn('GitHub device poll failed; will retry', { reason: error.message });
+        record.nextPollAt = Date.now() + record.intervalMs;
+      } finally {
+        record.polling = undefined;
+      }
+    })();
+    return record.polling;
+  };
+
+  const failurePage = (res: Response, outcome: Exclude<DeviceOutcome, { kind: 'success' }>): void => {
+    switch (outcome.kind) {
+      case 'not_allowed':
+        sendErrorPage(res, 403, 'Account not allowed', `The GitHub account ${outcome.login} is not allowed to use this whiteboard.`, '/oauth/login');
+        return;
+      case 'expired':
+        sendErrorPage(res, 400, 'Code expired', 'The sign-in code expired before it was entered on GitHub.', '/oauth/login');
+        return;
+      case 'denied':
+        sendErrorPage(res, 400, 'Sign-in cancelled', 'The sign-in was cancelled on GitHub.', '/oauth/login');
+        return;
+      case 'error':
+        sendErrorPage(res, 502, 'Sign-in failed', 'GitHub could not confirm the sign-in. Try again.', '/oauth/login');
+    }
+  };
 
   router.get('/oauth/login', loginLimiter, (req, res) => {
-    const returnTo = safeReturnPath(single(req.query.return_to));
-    const nonce = randomToken(24);
-    setCookie(res, stateCookie, signer.sign(GITHUB_STATE_PURPOSE, { nonce, returnTo }, GITHUB_STATE_TTL_SECONDS), GITHUB_STATE_TTL_SECONDS);
-    res.setHeader('Cache-Control', 'no-store');
-    res.redirect(302, githubAuthorizeUrl(config, nonce, githubCallbackUrl));
+    sendLoginPage(res, safeReturnPath(single(req.query.return_to)));
   });
 
-  router.get('/oauth/github/callback', loginLimiter, async (req, res, next) => {
+  router.post('/oauth/login', deviceStartLimiter, urlencoded, async (req, res, next) => {
     try {
-      const statePayload = signer.verify<{ nonce?: unknown; returnTo?: unknown }>(
-        GITHUB_STATE_PURPOSE, parseCookies(req.headers.cookie).get(stateCookie)
-      );
-      clearCookie(res, stateCookie);
-      const state = single(req.query.state);
-      if (!statePayload || typeof statePayload.nonce !== 'string' || !state || !constantTimeEqual(state, statePayload.nonce)) {
-        sendErrorPage(res, 400, 'Login failed', 'The login request expired or did not start here. Start again from the application.');
+      if (!sameOrigin(req)) {
+        sendErrorPage(res, 403, 'Forbidden', 'Cross-site request rejected.');
         return;
       }
-      const code = single(req.query.code);
-      if (!code) {
-        sendErrorPage(res, 400, 'Login cancelled', 'GitHub did not return an authorization code.');
+      pruneDeviceLogins();
+      if (deviceLogins.size >= MAX_PENDING_DEVICE_LOGINS) {
+        res.setHeader('Retry-After', '60');
+        sendErrorPage(res, 503, 'Too many sign-ins', 'Too many sign-ins are waiting for GitHub right now. Try again in a few minutes.', '/oauth/login');
         return;
       }
-      let login: string;
+      const returnTo = safeReturnPath(single(req.body?.return_to));
+      let device;
       try {
-        login = await exchangeGitHubCode(config, code, githubCallbackUrl);
+        device = await requestDeviceCode(config);
       } catch (error) {
         if (error instanceof GitHubLoginError) {
-          logger.warn('GitHub login failed', { reason: error.message });
-          sendErrorPage(res, 502, 'Login failed', 'GitHub could not confirm the login. Try again.');
+          logger.warn('GitHub device code request failed', { reason: error.message });
+          sendErrorPage(res, 502, 'Sign-in unavailable', 'GitHub did not start the sign-in. Check that Device Flow is enabled for the OAuth app, then try again.', '/oauth/login');
           return;
         }
         throw error;
       }
-      if (!config.allowedLogins.has(login.toLowerCase())) {
-        logger.warn('GitHub login not in ALLOWED_GITHUB_LOGINS', { login });
-        sendErrorPage(res, 403, 'Account not allowed', `The GitHub account ${login} is not allowed to use this whiteboard.`);
+      const lifetimeSeconds = Math.min(device.expiresInSeconds, MAX_DEVICE_LOGIN_SECONDS);
+      const now = Date.now();
+      const nonce = randomToken(24);
+      deviceLogins.set(nonce, {
+        deviceCode: device.deviceCode,
+        userCode: device.userCode,
+        verificationUri: device.verificationUri,
+        expiresAt: now + lifetimeSeconds * 1000,
+        intervalMs: device.intervalSeconds * 1000,
+        // RFC 8628 §3.5: wait one interval before the first poll.
+        nextPollAt: now + device.intervalSeconds * 1000,
+        returnTo
+      });
+      setCookie(res, deviceCookie, signer.sign(DEVICE_PURPOSE, { n: nonce }, lifetimeSeconds), lifetimeSeconds, 'Strict');
+      res.setHeader('Cache-Control', 'no-store');
+      res.redirect(303, '/oauth/device');
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  router.get('/oauth/device', loginLimiter, (req, res) => {
+    const found = deviceRecord(req);
+    if (!found) {
+      clearCookie(res, deviceCookie, 'Strict');
+      sendErrorPage(res, 400, 'No sign-in in progress', 'This sign-in expired or was not started in this browser.', '/oauth/login');
+      return;
+    }
+    const { nonce, record } = found;
+    if (record.outcome && record.outcome.kind !== 'success') {
+      // Shown once, then forgotten.
+      deviceLogins.delete(nonce);
+      clearCookie(res, deviceCookie, 'Strict');
+      failurePage(res, record.outcome);
+      return;
+    }
+    sendDevicePage(res, {
+      userCode: record.userCode,
+      verificationUri: record.verificationUri,
+      ...(config.github.appName ? { appName: config.github.appName } : {}),
+      intervalSeconds: Math.ceil(record.intervalMs / 1000),
+      expiresAt: record.expiresAt
+    });
+  });
+
+  router.get('/oauth/device.js', (_req, res) => {
+    sendDeviceScript(res);
+  });
+
+  router.post('/oauth/device/poll', devicePollLimiter, async (req, res, next) => {
+    try {
+      const wantsHtml = req.accepts(['json', 'html']) === 'html';
+      res.setHeader('Cache-Control', 'no-store');
+      if (!sameOrigin(req)) {
+        res.status(403).json({ status: 'forbidden', error: 'Cross-site request rejected' });
         return;
       }
-      setCookie(res, sessionCookie, signer.sign(SESSION_PURPOSE, { sub: login, sid: randomToken(16) }, config.sessionTtlSeconds), config.sessionTtlSeconds);
-      res.setHeader('Cache-Control', 'no-store');
-      res.redirect(302, safeReturnPath(typeof statePayload.returnTo === 'string' ? statePayload.returnTo : undefined));
+      const found = deviceRecord(req);
+      if (!found) {
+        if (wantsHtml) {
+          res.redirect(303, '/oauth/device');
+          return;
+        }
+        res.status(400).json({ status: 'unknown', error: 'No sign-in in progress in this browser' });
+        return;
+      }
+      const { nonce, record } = found;
+      await advanceDeviceLogin(record);
+      const outcome = record.outcome;
+      if (outcome?.kind === 'success') {
+        deviceLogins.delete(nonce);
+        clearCookie(res, deviceCookie, 'Strict');
+        setCookie(res, sessionCookie, signer.sign(SESSION_PURPOSE, { sub: outcome.login, sid: randomToken(16) }, config.sessionTtlSeconds), config.sessionTtlSeconds);
+        if (wantsHtml) {
+          res.redirect(303, record.returnTo);
+          return;
+        }
+        res.json({ status: 'complete', redirect: record.returnTo });
+        return;
+      }
+      if (wantsHtml) {
+        res.redirect(303, '/oauth/device');
+        return;
+      }
+      if (outcome) {
+        res.json({ status: 'failed', reason: outcome.kind });
+        return;
+      }
+      res.json({ status: 'pending', interval: Math.ceil(record.intervalMs / 1000) });
     } catch (error) {
       next(error);
     }
@@ -378,6 +571,7 @@ export function createAuth(config: AuthOnConfig, deps: AuthDeps = {}): Auth {
         return;
       }
       const ticket = signer.sign(CONSENT_PURPOSE, {
+        tid: randomToken(16),
         clientId: client.clientId,
         redirectUri,
         codeChallenge,
@@ -409,13 +603,21 @@ export function createAuth(config: AuthOnConfig, deps: AuthDeps = {}): Auth {
       }
       const session = readSession(req.headers.cookie);
       const ticket = signer.verify<{
-        clientId: string; redirectUri: string; codeChallenge: string; scope: string;
+        tid: string; clientId: string; redirectUri: string; codeChallenge: string; scope: string;
         resource: string; state: string | null; sid: string; login: string;
       }>(CONSENT_PURPOSE, single(req.body?.ticket));
-      if (!session || !ticket || ticket.sid !== session.sid || ticket.login !== session.login) {
+      if (!session || !ticket || typeof ticket.tid !== 'string' || ticket.sid !== session.sid || ticket.login !== session.login) {
         sendErrorPage(res, 400, 'Request expired', 'This approval request expired or belongs to another session. Start again from the application.');
         return;
       }
+      // Single use, whatever the decision: burnt before any await.
+      const nowTicket = nowSeconds();
+      for (const [id, expiresAt] of usedTickets) if (expiresAt <= nowTicket) usedTickets.delete(id);
+      if (usedTickets.has(ticket.tid)) {
+        sendErrorPage(res, 400, 'Request already used', 'This approval request was already answered. Start again from the application.');
+        return;
+      }
+      usedTickets.set(ticket.tid, ticket.exp);
       // The client could have changed its metadata document since the
       // consent page was shown; re-check the redirect against it.
       let client: ResolvedClient;
@@ -584,12 +786,15 @@ export function createAuth(config: AuthOnConfig, deps: AuthDeps = {}): Auth {
   };
 
   const protect: RequestHandler = (req: Request, res: Response, next: NextFunction) => {
+    // Express matches routes case-insensitively (`/API/elements` reaches the
+    // `/api/elements` handler), so paths are classified the same way.
+    const path = req.path.toLowerCase();
     // `/health` answers without credentials (it leaks nothing when auth is
     // on); `/mcp` has its own bearer check in the MCP router.
-    if (req.path === '/health' || req.path === '/mcp' || req.path === '/mcp/') return next();
+    if (path === '/health' || path === '/mcp' || path === '/mcp/') return next();
     if (isInternal(req)) return next();
 
-    if (req.path.startsWith('/api/')) {
+    if (path.startsWith('/api/') || path === '/api') {
       const token = bearerToken(req.headers.authorization);
       if (token) {
         const result = verifyAccessToken(token);
@@ -611,7 +816,15 @@ export function createAuth(config: AuthOnConfig, deps: AuthDeps = {}): Auth {
       return;
     }
 
-    if (readSession(req.headers.cookie)) return next();
+    if (readSession(req.headers.cookie)) {
+      // Any write authenticated by the cookie, whatever the path, must come
+      // from our own pages.
+      if (!SAFE_METHODS.has(req.method) && !sameOrigin(req)) {
+        res.status(403).json({ success: false, error: 'Cross-site request rejected' });
+        return;
+      }
+      return next();
+    }
     if (req.method === 'GET' || req.method === 'HEAD') {
       res.setHeader('Cache-Control', 'no-store');
       res.redirect(302, `/oauth/login?return_to=${encodeURIComponent(req.originalUrl)}`);

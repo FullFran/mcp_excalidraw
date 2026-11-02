@@ -1540,6 +1540,18 @@ app.get('/api/sync/status', (req: Request, res: Response) => {
 
 // Error handling middleware
 app.use((err: Error, req: Request, res: Response, next: NextFunction) => {
+  // Client errors raised by middleware on the OAuth endpoints (body-parser: 413
+  // payload too large, 400 malformed JSON) are the client's problem, not a
+  // server failure. Scoped to /oauth so the existing /api error responses are
+  // unchanged.
+  const status = (err as { status?: unknown; statusCode?: unknown }).status ?? (err as { statusCode?: unknown }).statusCode;
+  const isOAuthPath = req.path.toLowerCase().startsWith('/oauth/');
+  if (isOAuthPath && typeof status === 'number' && status >= 400 && status < 500) {
+    logger.warn('Rejected request', { status, method: req.method, path: req.path, type: (err as { type?: unknown }).type });
+    if (res.headersSent) return next(err);
+    res.status(status).json({ success: false, error: status === 413 ? 'Request body too large' : 'Bad request' });
+    return;
+  }
   logger.error('Unhandled error:', err);
   res.status(500).json({
     success: false,
@@ -1614,6 +1626,9 @@ function selfUrl(): string {
 async function startServer(): Promise<void> {
   if (publicBaseUrlError) throw publicBaseUrlError;
   if (authConfigError) throw authConfigError;
+  if (authConfig?.mode === 'oauth') {
+    for (const warning of authConfig.warnings) logger.warn(warning);
+  }
   if (authConfig?.mode === 'off' && authConfig.insecure) {
     logger.warn(
       `Authentication is OFF on non-loopback HOST=${HOST} (ALLOW_INSECURE_NO_AUTH=true): ` +
