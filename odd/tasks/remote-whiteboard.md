@@ -16,7 +16,7 @@ Branch: `feat/remote-whiteboard` (work units merged to `main` of FullFran/mcp_ex
 |----|-------|-------|--------|----------|
 | T0 | S1, S6 | inline | done | fork + clone + upstream remote; milestones 1-4, issues #1-#8; Notion ticket 40c21333-8135-81f3-b292-f1b2b9e2fb4c; baseline `npm test` exit 0 at 66b768b |
 | T1 | S2 | delegated (writer trigger b: long-session context backstop) | done (uncommitted) | RED: `npm run test:mcp-http` 7/9 failing (404 on /mcp); GREEN: 9/9; `npm run test:mcp` 5/5; `npm test` exit 0; `npm run type-check` exit 0 |
-| T2 | S3 | pending | pending | |
+| T2 | S3 | delegated (writer trigger b: long-session context backstop) | in progress | Risk item 2 (auth): independent verifier over T1+T2 after it |
 | T3 | S4 | pending | pending | |
 | T4 | S5 | pending | blocked: needs VPS authorization | |
 
