@@ -1133,6 +1133,32 @@ async function checkInProcess(github) {
   let httpBlocked = false;
   try { await safeFetch(`http://example.com/client.json`); } catch (error) { httpBlocked = /only https/.test(error.message); }
   assert(httpBlocked, 'safeFetch refuses http');
+
+  // A transient resolver failure (EAI_AGAIN) is retried once; a permanent one
+  // (ENOTFOUND) is not, and its code reaches the error message.
+  const flaky = () => {
+    let calls = 0;
+    const resolve = async () => {
+      calls += 1;
+      if (calls === 1) throw Object.assign(new Error('getaddrinfo EAI_AGAIN'), { code: 'EAI_AGAIN' });
+      return [{ address: '127.0.0.1', family: 4 }];
+    };
+    return { resolve, calls: () => calls };
+  };
+  const retried = flaky();
+  const fetched = await safeFetch(`${cimdBase}/client.json`, { ca: tls.cert, addressGuard: () => true, resolve: retried.resolve });
+  // No document is registered at this path, so the host answers 404: what matters is that it was reached.
+  assertEqual(fetched.status, 404, 'safeFetch reaches the host after one transient DNS failure');
+  assertEqual(retried.calls(), 2, 'a transient DNS failure is retried exactly once');
+  let notFoundCalls = 0;
+  let notFoundMessage = '';
+  try {
+    await safeFetch('https://does-not-exist.invalid/client.json', {
+      resolve: async () => { notFoundCalls += 1; throw Object.assign(new Error('getaddrinfo ENOTFOUND'), { code: 'ENOTFOUND' }); }
+    });
+  } catch (error) { notFoundMessage = error.message; }
+  assertEqual(notFoundCalls, 1, 'a permanent DNS failure is not retried');
+  assert(/cannot resolve does-not-exist\.invalid \(ENOTFOUND\)/.test(notFoundMessage), `DNS error code is reported (${notFoundMessage})`);
   assert(!clients.isCimdClientId(`http://localhost:${cimdHost.port}/client.json`), 'http client_id is not a CIMD URL');
   assert(!clients.isCimdClientId('https://example.com'), 'CIMD client_id needs a path');
   const strictResolver = new clients.CimdResolver();
@@ -1276,3 +1302,6 @@ try {
   await github.close();
 }
 if (process.exitCode !== 1) rmSync(scratch, { recursive: true, force: true });
+// In-process fixtures (the HTTPS CIMD host, ...) may still hold the event loop
+// open after a failed group; spawned servers are already killed above.
+process.exit(process.exitCode ?? 0);

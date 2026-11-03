@@ -47,6 +47,33 @@ export interface SafeFetchOptions {
   ca?: string | Buffer;
   timeoutMs?: number;
   maxBytes?: number;
+  /** Name resolution (defaults to the system resolver); injectable for tests. */
+  resolve?: (hostname: string) => Promise<{ address: string; family: number }[]>;
+}
+
+/** Resolver errors worth one retry: the name may exist, the resolver just failed. */
+const TRANSIENT_DNS_CODES = new Set(['EAI_AGAIN', 'ETIMEOUT', 'ESERVFAIL', 'ECONNREFUSED']);
+const DNS_RETRY_DELAY_MS = 300;
+
+const systemResolve = (hostname: string) => lookup(hostname, { all: true, verbatim: true });
+
+async function resolveWithRetry(
+  hostname: string,
+  resolve: (hostname: string) => Promise<{ address: string; family: number }[]>
+): Promise<{ address: string; family: number }[]> {
+  try {
+    return await resolve(hostname);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code ?? '';
+    if (!TRANSIENT_DNS_CODES.has(code)) throw new SafeFetchError(`cannot resolve ${hostname}${code ? ` (${code})` : ''}`);
+  }
+  await new Promise(done => setTimeout(done, DNS_RETRY_DELAY_MS));
+  try {
+    return await resolve(hostname);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code ?? '';
+    throw new SafeFetchError(`cannot resolve ${hostname}${code ? ` (${code})` : ''}`);
+  }
 }
 
 export interface SafeFetchResult {
@@ -87,11 +114,7 @@ export async function safeFetch(rawUrl: string, options: SafeFetchOptions = {}):
   if (isIP(hostname)) {
     addresses = [{ address: hostname, family: isIP(hostname) }];
   } else {
-    try {
-      addresses = await lookup(hostname, { all: true, verbatim: true });
-    } catch {
-      throw new SafeFetchError(`cannot resolve ${hostname}`);
-    }
+    addresses = await resolveWithRetry(hostname, options.resolve ?? systemResolve);
   }
   if (addresses.length === 0) throw new SafeFetchError(`cannot resolve ${hostname}`);
   const blocked = addresses.find(entry => !guard(entry.address));
